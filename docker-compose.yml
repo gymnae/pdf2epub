@@ -20,6 +20,7 @@ services:
       # --- THE ULTIMATE CACHE TRAP ---
       # Force every single library (Surya, PyTorch, HuggingFace)
       # to write to our bind mount instead of ephemeral container folders.
+      # test
       - HOME=/app/model_cache/home
       - XDG_CACHE_HOME=/app/model_cache/xdg
       - HF_HOME=/app/model_cache/huggingface

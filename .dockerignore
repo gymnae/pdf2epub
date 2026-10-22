@@ -1,0 +1,10 @@
+# Host-side data that is bind-mounted at runtime, never baked into the image
+library/
+model_cache/
+
+.git/
+.github/
+__pycache__/
+*.pyc
+*.epub
+*.pdf

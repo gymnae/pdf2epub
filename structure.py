@@ -13,8 +13,8 @@ layouts hard to read on an e-reader. This module works on marker's block tree
   * consistent heading levels, no publisher cover sheet, no running heads,
   * only links whose text matches their target (marker's link offsets drift),
   * sub/superscripts and drop caps that the PDF text layer or marker lost,
-  * figure crops aligned with the page as rendered (CropBox offsets) and kept
-    clear of captions and body text.
+  * figure crops snapped to what the PDF really draws there (marker's layout
+    boxes can be off by several lines), never including captions or body text.
 
 Everything here is pure Python; `analyzer` (pdfanalysis.PdfAnalyzer) is optional.
 """
@@ -23,9 +23,7 @@ import contextvars
 import html as htmllib
 import os
 import re
-import statistics
 import unicodedata
-from collections import Counter
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import quote
@@ -36,6 +34,8 @@ FIGURE_MAX_PX = int(os.environ.get("FIGURE_MAX_PX", "1600"))
 # Uncaptioned pictures smaller than this (fraction of the page) are publisher
 # logos, licence badges, "Check for updates" buttons and the like.
 DECORATION_MAX_AREA = float(os.environ.get("DECORATION_MAX_AREA", "0.025"))
+# Tallest image (height / width) shown at full width: 0.85 of a 3:4 screen.
+PORTRAIT_FIT = 0.85 * 4 / 3
 
 PARA_TYPES = {"Text", "TextInlineMath", "Handwriting", "ComplexRegion", "ListItem"}
 IMAGE_TYPES = {"Figure", "Picture"}
@@ -561,8 +561,8 @@ class Converter:
         self.title = None
         self._style_cache = {}
         self._fig_count = 0
-        self._shift = {}         # page -> (dx, dy): marker frame -> rendered-page frame
-        self._page_texts = {}    # page -> [(kind, bbox)] of text blocks, for figure crops
+        self._page_texts = {}    # page -> [(kind, bbox, text)] of text blocks, for figure crops
+        self._page_floats = {}   # page -> [bbox] of figures and tables
 
     # ---- collection
 
@@ -627,62 +627,6 @@ class Converter:
         self.stats[key] = self.stats.get(key, 0) + n
 
     # ---- PDF-assisted repairs
-
-    def _to_pdf(self, page, rect):
-        dx, dy = self._shift.get(page, (0.0, 0.0))
-        return (rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy)
-
-    def _from_pdf(self, page, rect):
-        dx, dy = self._shift.get(page, (0.0, 0.0))
-        return (rect[0] - dx, rect[1] - dy, rect[2] - dx, rect[3] - dy)
-
-    def _calibrate(self, items):
-        """On PDFs whose CropBox sits inside a larger MediaBox, marker's boxes can be
-        off by the CropBox origin, so figure crops cut off one side and pull in the
-        caption. Check paragraph starts against the PDF text layer and remember the
-        shift that lines them up (none, +offset or -offset)."""
-        if self.an is None:
-            return
-        paras = {}
-        for it in items:
-            if it.kind == "para" and len(it.text) >= 30:
-                paras.setdefault(it.page, []).append(it)
-        votes = Counter()
-        for page, its in paras.items():
-            try:
-                ox, oy = self.an.frame_offset(page)
-            except Exception:
-                continue
-            if abs(ox) < 0.01 and abs(oy) < 0.01:
-                continue
-            pts = []
-            for it in its[:12]:
-                snippet = " ".join(it.text.split()[:4])
-                if len(snippet) < 12:
-                    continue
-                try:
-                    box = self.an.locate(page, snippet)
-                except Exception:
-                    box = None
-                if box:
-                    pts.append((it.bbox, box))
-            if len(pts) < 2:
-                continue
-            err = {sign: statistics.median(abs(b[0] - a[0] - sign * ox) + abs(b[1] - a[1] - sign * oy)
-                                           for a, b in pts) for sign in (0, 1, -1)}
-            best = min(err, key=err.get)
-            votes[best if best and err[best] < 0.5 * err[0] else 0] += 1
-        sign = votes.most_common(1)[0][0] if votes else 0
-        if not sign:
-            return
-        for page in range(self.page_count):
-            try:
-                ox, oy = self.an.frame_offset(page)
-            except Exception:
-                continue
-            if abs(ox) >= 0.01 or abs(oy) >= 0.01:
-                self._shift[page] = (sign * ox, sign * oy)
-        self._count("frame_offset_pages", len(self._shift))
 
     @staticmethod
     def _apply_scripts(html, patterns):
@@ -784,10 +728,21 @@ class Converter:
         return items
 
     def _drop_decorations(self, items):
+        """Publisher logos, licence badges, "Check for updates" buttons: small,
+        uncaptioned, and either on the first page or repeated in the same spot on
+        several pages. Elsewhere small uncaptioned pictures are content (icons,
+        structural formulas in books) and stay."""
+        small = lambda it: (it.kind == "figure" and it.caption is None
+                            and (it.bbox[2] - it.bbox[0]) * (it.bbox[3] - it.bbox[1]) < DECORATION_MAX_AREA)
+        spot = lambda it: tuple(round(v, 2) for v in it.bbox)
+        first_page = min((it.page for it in items), default=0)
+        spots = {}
+        for it in items:
+            if small(it):
+                spots.setdefault(spot(it), set()).add(it.page)
         out = []
         for it in items:
-            x0, y0, x1, y1 = it.bbox
-            if it.kind == "figure" and it.caption is None and (x1 - x0) * (y1 - y0) < DECORATION_MAX_AREA:
+            if small(it) and (it.page == first_page or len(spots[spot(it)]) >= 3):
                 self._count("decorations_dropped")
                 continue
             out.append(it)
@@ -795,17 +750,32 @@ class Converter:
 
     def _index_texts(self, items):
         for it in items:
+            if it.kind in ("figure", "table"):
+                self._page_floats.setdefault(it.page, []).append(it.bbox)
             for t in ([it] + (it.children if it.kind == "box" else [])):
                 if isinstance(t, Item) and t.kind in ("para", "heading", "list", "caption", "footnote", "equation"):
-                    self._page_texts.setdefault(t.page, []).append((t.kind, t.bbox))
+                    self._page_texts.setdefault(t.page, []).append((t.kind, t.bbox, t.text))
             if it.caption is not None:
-                self._page_texts.setdefault(it.caption.page, []).append(("caption", it.caption.bbox))
+                self._page_texts.setdefault(it.caption.page, []).append(("caption", it.caption.bbox, it.caption.text))
 
     def _figure_rect(self, it):
-        """Shrink a figure's box so that it does not reach into the caption or body
+        """The crop for a figure: what the PDF really draws there if the analyzer can
+        tell, else marker's box shrunk so it does not reach into the caption or body
         text above/below it (marker's boxes often include the caption's first line)."""
-        x0, y0, x1, y1 = it.bbox
-        for kind, tb in self._page_texts.get(it.page, []):
+        if self.an is not None:
+            try:
+                # Prose, headings and captions only: short blocks may be figure labels.
+                known = [text for kind, _, text in self._page_texts.get(it.page, [])
+                         if kind in ("heading", "caption", "footnote") or len(text) >= 40]
+                others = [b for b in self._page_floats.get(it.page, []) if b is not it.bbox]
+                snapped = self.an.content_rect(it.page, it.bbox, known, others)
+            except Exception:
+                snapped = None
+            if snapped is not None:
+                self._count("figures_snapped")
+                return snapped
+        x0, y0, x1, y1 = (it.bbox[0] - 0.004, it.bbox[1] - 0.004, it.bbox[2] + 0.004, it.bbox[3] + 0.004)
+        for kind, tb, _ in self._page_texts.get(it.page, []):
             if min(x1, tb[2]) - max(x0, tb[0]) <= 0.3 * min(x1 - x0, tb[2] - tb[0]):
                 continue                      # different column
             if tb[1] >= y1 or tb[3] <= y0:
@@ -817,7 +787,7 @@ class Converter:
             else:
                 y0 = max(y0, tb[3] + 0.004)
         if y1 - y0 < 0.5 * (it.bbox[3] - it.bbox[1]):
-            return it.bbox                    # would cut away most of it: keep marker's box
+            return (it.bbox[0] - 0.004, it.bbox[1] - 0.004, it.bbox[2] + 0.004, it.bbox[3] + 0.004)
         return (x0, y0, x1, y1)
 
     # ---- cleanup passes
@@ -842,13 +812,16 @@ class Converter:
                 pages_of.setdefault(key(it), set()).add(it.page)
         threshold = max(3, 0.3 * self.page_count)
         repeated = {k for k, pages in pages_of.items() if len(pages) >= threshold}
+        # Books change running heads per chapter: in the page margins, three pages suffice.
+        repeated_margin = {k for k, pages in pages_of.items() if len(pages) >= 3}
         out = []
         for it in items:
             if it.kind in ("para", "heading"):
                 text = it.text
                 sentence = text.endswith(".") and len(text.split()) >= 5
-                boilerplate = key(it) in repeated and (self._in_margin(it) or (
-                    len(pages_of[key(it)]) >= 0.5 * self.page_count and not sentence))
+                boilerplate = ((key(it) in repeated_margin and self._in_margin(it))
+                               or (key(it) in repeated and len(pages_of[key(it)]) >= 0.5 * self.page_count
+                                   and not sentence))
                 page_number = self._in_margin(it) and re.fullmatch(r"(page\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?", text, re.I)
                 junk = re.fullmatch(r"[\d():,;.\-]{8,}", text) is not None  # e.g. Nature's "1234567890():,;"
                 if boilerplate or page_number or junk:
@@ -909,9 +882,9 @@ class Converter:
         pages = sorted({it.page for it in items})
         for p in pages:
             on_page = [it for it in items if it.page == p]
-            exclude = [self._to_pdf(p, it.bbox) for it in on_page if it.kind in ("figure", "table")]
+            exclude = [it.bbox for it in on_page if it.kind in ("figure", "table")]
             try:
-                rects = [self._from_pdf(p, r) for r in self.an.box_regions(p, exclude)]
+                rects = self.an.box_regions(p, exclude)
             except Exception:
                 continue
             text_items = [it for it in on_page if it.kind in ("para", "heading", "list", "equation")]
@@ -1094,8 +1067,7 @@ class Converter:
         if self.an is not None:
             try:
                 from pdfanalysis import encode_image
-                img = self.an.render_region(item.page, self._to_pdf(item.page, rect),
-                                            dpi=FIGURE_DPI, max_px=FIGURE_MAX_PX)
+                img = self.an.render_region(item.page, rect, dpi=FIGURE_DPI, max_px=FIGURE_MAX_PX, pad=0)
                 if img is not None:
                     data, ext = encode_image(img)
             except Exception:
@@ -1114,6 +1086,19 @@ class Converter:
         with open(os.path.join(self.out_dir, rel), "wb") as f:
             f.write(data)
         return rel
+
+    def _display_width(self, rel):
+        """Width (percent) for a portrait image, so that its height stays within
+        ~85% of a 3:4 e-reader screen even where readers ignore max-height in vh.
+        None for images that already fit by width."""
+        try:
+            from PIL import Image
+            with Image.open(os.path.join(self.out_dir, rel)) as im:
+                w, h = im.size
+        except Exception:
+            return None
+        aspect = h / w if w else 0
+        return round(100 * PORTRAIT_FIT / aspect) if aspect > PORTRAIT_FIT else None
 
     def _caption_md(self, item):
         if item.caption is None:
@@ -1151,7 +1136,11 @@ class Converter:
             if rel is None:
                 return self._caption_md(it)
             self.stats["figures"] = self.stats.get("figures", 0) + 1
-            return f"![{self._caption_md(it)}]({rel}){{#fig{self._fig_count}}}"
+            width = self._display_width(rel)
+            # max-width, not width: together with the stylesheet's max-height it scales
+            # proportionally; a fixed width plus a clamped height would distort the image.
+            attrs = f"#fig{self._fig_count}" + (f' style="max-width:{width}%"' if width else "")
+            return f"![{self._caption_md(it)}]({rel}){{{attrs}}}"
         if it.kind == "table":
             return self._render_table(it)
         if it.kind == "box":
@@ -1169,7 +1158,9 @@ class Converter:
         wide = table is not None and _table_columns(table) >= TABLE_IMAGE_MIN_COLS
         if table is None or wide:
             self._fig_count += 1
-            rel = self._save_image(it, it.bbox, f"p{it.page + 1}_table{self._fig_count}")
+            x0, y0, x1, y1 = it.bbox
+            rel = self._save_image(it, (x0 - 0.004, y0 - 0.004, x1 + 0.004, y1 + 0.004),
+                                   f"p{it.page + 1}_table{self._fig_count}")
             if rel:
                 parts.append(f"![]({rel}){{.table-image}}")
         if table is not None:
@@ -1258,7 +1249,6 @@ class Converter:
             _MATHPI.reset(token)
 
     def _convert(self, items):
-        self._calibrate(items)
         items = self._drop_noise(items)
         self._scripts(items)
         items = self._drop_caps(items)

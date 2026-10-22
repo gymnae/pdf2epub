@@ -41,6 +41,11 @@ SCRIPT_SIZE_RATIO = 0.88    # sub/superscript glyphs are <= ~80% of the base gly
 SCRIPT_SHIFT_RATIO = 0.12   # ... and their baseline moves by >= ~15% of it
 SCRIPT_CHARS = re.compile(r"[0-9A-Za-z,+\-−–*†‡§¶‖'′=().α-ωΔ]")
 DROP_CAP_RATIO = 1.8        # a drop cap is >= ~2 lines tall
+INK_DELTA = 24              # grey-level difference from the page background that counts as drawn
+CAPTION_START = re.compile(
+    r"\s*(fig(ure|ura)?|figs?|tab(le|la|leau|elle)?|plate|chart|map|scheme|exhibit|illustration|"
+    r"graph(ique)?|abb(ildung)?|bild|karte|schema|рис(унок)?|табл(ица)?)\.?\s*[0-9IVXA-Z]{1,4}([.\-–][0-9]+)*\b",
+    re.I)
 
 
 def _wide_text(buf_len_fn, fill_fn):
@@ -58,6 +63,7 @@ class PdfAnalyzer:
         self._font_cache = {}
         self._body_style = None
         self._page_text = {}
+        self._glyph_cache = {}
 
     def close(self):
         try:
@@ -91,31 +97,15 @@ class PdfAnalyzer:
         left, top, w, h = self._frame(index)
         return ((l - left) / w, (top - t) / h, (r - left) / w, (top - b) / h)
 
-    def frame_offset(self, index):
-        """Offset of the visible area inside the MediaBox, as page fractions.
-        Non-zero for e.g. HighWire/Royal Society PDFs, whose CropBox trims an A4
-        MediaBox; tools that mix the two frames place everything off by this much."""
-        page = self.pdf[index]
-        left, top, w, h = self._frame(index)
-        ml, _, _, mt = page.get_mediabox()
-        return (left - ml) / w, (mt - top) / h
-
-    def locate(self, index, snippet):
-        """Box of the first character of `snippet` if it occurs exactly once on the page."""
-        tp = self.pdf[index].get_textpage()
-        searcher = tp.search(snippet, match_case=True)
-        hit = searcher.get_next()
-        if hit is None or searcher.get_next() is not None:
-            return None
-        l, b, r, t = tp.get_charbox(hit[0], loose=True)
-        return self.to_frac(index, l, b, r, t)
-
     # ---------------------------------------------------- glyph-level text
 
     def _glyphs(self, index):
-        """[(char, generated, height, origin_x, origin_y, right)] in text order.
-        Height is the loose (font ascent-descent) box, so it tracks the effective
-        font size even where FPDFText_GetFontSize ignores the text matrix."""
+        """[(char, generated, height, origin_x, origin_y, right, (l, b, r, t))] in text
+        order, PDF user space. Height is the loose (font ascent-descent) box, so it
+        tracks the effective font size even where FPDFText_GetFontSize ignores the
+        text matrix."""
+        if index in self._glyph_cache:
+            return self._glyph_cache[index]
         tp = self.pdf[index].get_textpage()
         out = []
         x, y = ctypes.c_double(), ctypes.c_double()
@@ -125,7 +115,10 @@ class PdfAnalyzer:
             gen = pdfium_c.FPDFText_IsGenerated(tp.raw, i) == 1
             l, b, r, t = tp.get_charbox(i, loose=True)
             pdfium_c.FPDFText_GetCharOrigin(tp.raw, i, ctypes.byref(x), ctypes.byref(y))
-            out.append((ch, gen, t - b, x.value, y.value, r))
+            out.append((ch, gen, t - b, x.value, y.value, r, (l, b, r, t)))
+        self._glyph_cache[index] = out
+        if len(self._glyph_cache) > 4:            # passes revisit nearby pages; keep a few
+            self._glyph_cache.pop(next(iter(self._glyph_cache)))
         return out
 
     def script_runs(self, index):
@@ -143,7 +136,7 @@ class PdfAnalyzer:
         found = Counter()
         i, n = 0, len(glyphs)
         while i < n:
-            ch, gen, h, x, y, _ = glyphs[i]
+            ch, gen, h, x, y, *_ = glyphs[i]
             if gen or not ch.strip() or h <= 0 or h > 1.5 * body_h:
                 i += 1
                 continue
@@ -153,7 +146,7 @@ class PdfAnalyzer:
                 j += 1                     # one generated space ("Dolan 1")
             run, kind, k = [], None, j
             while k < n:
-                c2, gen2, h2, x2, y2, _ = glyphs[k]
+                c2, gen2, h2, x2, y2, *_ = glyphs[k]
                 dy = y2 - y
                 if (gen2 or h2 <= 0 or h2 > SCRIPT_SIZE_RATIO * h or abs(dy) < SCRIPT_SHIFT_RATIO * h
                         or abs(dy) > 0.8 * h or not SCRIPT_CHARS.fullmatch(c2 or " ")):
@@ -366,6 +359,171 @@ class PdfAnalyzer:
             result[style] = sorted(keep, key=len, reverse=True)
         return result
 
+    # ------------------------------------------------------- figure extents
+
+    def text_lines(self, index):
+        """[(rect, chars, text)] per text line (rotated text yields one entry per glyph)."""
+        lines, cur, prev = [], [], None
+
+        def flush():
+            boxes = [g[6] for g in cur if not g[1] and g[0].strip()]
+            if boxes:
+                l, b = min(x[0] for x in boxes), min(x[1] for x in boxes)
+                r, t = max(x[2] for x in boxes), max(x[3] for x in boxes)
+                text = "".join(g[0] for g in cur).strip()
+                lines.append((self.to_frac(index, l, b, r, t), len(boxes), text))
+
+        for g in self._glyphs(index):
+            ch, gen, h, x, y = g[:5]
+            if ch in ("\r", "\n"):
+                flush()
+                cur, prev = [], None
+                continue
+            if not ch.strip() or h <= 0:
+                cur.append(g)
+                continue
+            if prev is not None and (abs(y - prev[4]) > 0.6 * max(h, prev[2]) or x < prev[3] - 1):
+                flush()
+                cur = []
+            cur.append(g)
+            prev = g
+        flush()
+        return lines
+
+    def _prose_lines(self, index, known_texts=(), lines=None):
+        """Boxes of text lines that are running text, captions, headings or running
+        heads, i.e. never part of a figure. Running text is wide, horizontal and
+        dense (axis tick rows are sparse, axis titles short); a paragraph's short
+        last line is recognised by body-size type starting at the text column's
+        edge; anything else is excluded when it is part of `known_texts` (text
+        blocks marker found on the page, e.g. a heading right above a photo)."""
+        lines = self.text_lines(index) if lines is None else lines
+        known = [_norm(t) for t in known_texts if t]
+        # Running text relative to this page's own type: wide lines whose character
+        # density is close to the body text's (large-print books, small formats and
+        # dense journals all differ in absolute terms; tick rows are always sparse).
+        wide = [(fr, n) for fr, n, _ in lines if n >= 20 and fr[2] - fr[0] >= 0.25 and fr[2] - fr[0] > fr[3] - fr[1]]
+        body_density = statistics.median(n / (fr[2] - fr[0]) for fr, n in wide) if wide else 0
+        running = [fr for fr, n in wide if n / (fr[2] - fr[0]) >= 0.6 * body_density]
+        out = list(running)
+        if running:
+            body_h = statistics.median(fr[3] - fr[1] for fr in running)
+            left = statistics.median(fr[0] for fr in running)
+        for fr, n, text in lines:
+            if fr in running:
+                continue
+            w, h = fr[2] - fr[0], fr[3] - fr[1]
+            core = _norm(text).rstrip("-")
+            if (CAPTION_START.match(text) or fr[3] < 0.07 or fr[1] > 0.93
+                    or (len(core) >= 8 and any(core in k for k in known))
+                    or (running and n >= 8 and w > h and n / max(w, 1e-6) >= 0.6 * body_density
+                        and abs(h - body_h) <= 0.15 * body_h and left - 0.005 <= fr[0] <= left + 0.04)):
+                out.append(fr)
+        return out, (statistics.median(fr[3] - fr[1] for fr in running) if running else 0)
+
+    def content_rect(self, index, rect, known_texts=(), others=(), reach=0.25, gap_pt=12.0):
+        """The visible extent of the figure that `rect` (marker's layout box, which can
+        be off by several lines) points at. The page is rendered with running text,
+        captions and running heads blanked out; starting from the ink inside `rect`,
+        the box grows by all ink within `gap_pt` (axis labels, legends, panel
+        letters, the other panels) but at most `reach` (page fraction) beyond `rect`.
+        Working on pixels makes clip paths, transforms and stray path geometry
+        irrelevant. `others` are the boxes of the page's other figures/tables: if one
+        overlaps `rect`, the start is narrowed to the band of ink (split at blank
+        rows) that belongs to `rect` rather than to them. Returns page fractions,
+        or None if `rect` holds no ink, the page is rotated (frames would not match)
+        or it has no text layer (a pure scan: text could not be told from figure)."""
+        from PIL import ImageDraw
+        page = self.pdf[index]
+        if page.get_rotation():
+            return None
+        lines = self.text_lines(index)
+        if not lines:
+            return None
+        W, H = page.get_size()
+        img = page.render(scale=1.0).to_pil().convert("L")
+        pw, ph = img.size
+        hist = img.histogram()
+        background = max(range(256), key=hist.__getitem__)    # paper colour, not assumed white
+        draw = ImageDraw.Draw(img)
+        prose, body_h = self._prose_lines(index, known_texts, lines)
+        for fr in prose:
+            draw.rectangle([fr[0] * pw - 1, fr[1] * ph - 1, fr[2] * pw + 1, fr[3] * ph + 1], fill=background)
+        mask = img.point(lambda v: 255 if abs(v - background) > INK_DELTA else 0)
+        gap_pt = max(gap_pt, body_h * H)                       # at least one body line
+        px = lambda r: (int(r[0] * pw), int(r[1] * ph), int(r[2] * pw + 0.999), int(r[3] * ph + 0.999))
+        region = px((rect[0] - reach, rect[1] - reach, rect[2] + reach, rect[3] + reach))
+        region = (max(0, region[0]), max(0, region[1]), min(pw, region[2]), min(ph, region[3]))
+
+        def ink(box):
+            box = (max(box[0], region[0]), max(box[1], region[1]), min(box[2], region[2]), min(box[3], region[3]))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return None
+            bb = mask.crop(box).getbbox()
+            return None if bb is None else (box[0] + bb[0], box[1] + bb[1], box[0] + bb[2], box[1] + bb[3])
+
+        g = max(1, round(gap_pt * pw / W))
+
+        def bands_of(box):
+            """Ink rows inside `box`, split where >= the gap of blank rows separates them."""
+            bands, start, blank = [], None, 0
+            for y in range(box[1], box[3]):
+                if mask.crop((box[0], y, box[2], y + 1)).getbbox():
+                    if start is None:
+                        start = y
+                    blank = 0
+                elif start is not None:
+                    blank += 1
+                    if blank >= g:
+                        bands.append((box[0], start, box[2], y - blank + 1))
+                        start, blank = None, 0
+            if start is not None:
+                bands.append((box[0], start, box[2], box[3] - blank))
+            return bands
+
+        def core(box, rivals):
+            """Ink inside `box`, without slivers cut off at its top/bottom edge (the
+            border of a neighbouring table, a caption's last line) and, where a rival
+            box overlaps, only the band that belongs to `box` rather than to them."""
+            found = ink(box)
+            if found is None:
+                return None
+            bands = bands_of(found)
+            if len(bands) > 1:
+                total = found[3] - found[1]
+                kept = [b for b in bands if not ((b[1] <= box[1] + 2 or b[3] >= box[3] - 2)
+                                                 and b[3] - b[1] < 0.2 * total)]
+                bands = kept or bands
+            rivals = [r for r in rivals if _intersection(r, box) > 0]
+            if rivals:
+                score = lambda b: _intersection(b, box) - max(_intersection(b, r) for r in rivals)
+                bands = [max(bands, key=score)]
+            union = bands[0]
+            for b in bands[1:]:
+                union = _union(union, b)
+            return ink(union) or found
+
+        own = px(rect)
+        rivals = [px(o) for o in others]
+        cur = core(own, rivals)
+        if cur is None:
+            return None
+        # Neighbouring figures/tables: their own cores are off limits for growth.
+        barriers = [c for c in (core(r, [own]) for r in rivals) if c and not _intersection(c, cur)]
+        changed = True
+        while changed:                 # grow one side at a time, never into a neighbour
+            changed = False
+            for side in range(4):
+                probe = list(cur)
+                probe[side] += g if side >= 2 else -g
+                grown = ink(tuple(probe))
+                nxt = _union(cur, grown) if grown else cur
+                if nxt != cur and not any(_intersection(nxt, b) for b in barriers):
+                    cur, changed = nxt, True
+        pad_x, pad_y = 3.0 / W, 3.0 / H
+        return (max(0.0, cur[0] / pw - pad_x), max(0.0, cur[1] / ph - pad_y),
+                min(1.0, cur[2] / pw + pad_x), min(1.0, cur[3] / ph + pad_y))
+
     # ------------------------------------------------------------------ boxes
 
     def box_regions(self, index, exclude=()):
@@ -438,6 +596,14 @@ def _intersection(a, b):
 def _overlap_fraction(a, b):
     """Fraction of `a` covered by `b`."""
     return _intersection(a, b) / _area(a) if _area(a) else 0.0
+
+
+def _norm(text):
+    return re.sub(r"\s+", "", text).lower()
+
+
+def _union(a, b):
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
 
 def _iou(a, b):

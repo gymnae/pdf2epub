@@ -3,8 +3,13 @@
 # marker 1.10.1), so the torch-based 1.10 line fits this host better.
 marker-pdf==1.10.2
 surya-ocr==0.17.1
+# PyPI build with bundled CUDA 12.8 libraries: only the host's NVIDIA driver is
+# needed, no CUDA base image. Newer torch defaults to newer CUDA (= newer driver).
+torch==2.8.0
 # NVML bindings: lets the web process check GPU memory without creating a CUDA context.
 nvidia-ml-py
-# torch, transformers, pypdfium2, Pillow come in via marker-pdf. Pin torch and
-# gradio to what `pip freeze` shows in your current, working container.
+# Pure-Python TeX math -> SVG (replaces TeX Live + dvisvgm).
+ziamath==0.13
+ziafont==0.11
+latex2mathml==3.81.1
 gradio

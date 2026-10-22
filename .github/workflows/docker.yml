@@ -15,6 +15,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  TEST_TAG: pdf2epub:test
 
 jobs:
   build:
@@ -23,7 +24,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      # torch + CUDA wheels make the image ~10 GB; the stock runner is short on disk.
+      # torch + CUDA wheels make the image several GB; the stock runner is short on disk.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -60,28 +61,33 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
 
-      - name: Build (and push outside pull requests)
+      # Layer cache lives in the registry: the torch layer alone is larger than
+      # what fits comfortably in the 10 GB GitHub Actions cache.
+      - name: Build and load for testing
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
+          tags: ${{ env.TEST_TAG }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', env.REGISTRY, env.IMAGE_NAME) || '' }}
+
+      # Distroless: no shell in the image, the checks run in Python (no GPU needed).
+      - name: Self-test the image
+        run: docker run --rm --entrypoint /venv/bin/python "$TEST_TAG" selftest.py
+
+      - name: Image size
+        run: docker image ls "$TEST_TAG" --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+      # Only reached when the self-test passed; all layers come from the builder cache.
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Smoke test the image
-        if: github.event_name != 'pull_request'
-        run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}"
-          docker run --rm --entrypoint sh "$IMAGE" -c '
-            set -e
-            pandoc --version | head -1
-            kepubify --version
-            latex --version | head -1
-            dvisvgm --version
-            kpsewhich preview.sty
-            command -v marker_single
-            python3 -c "import gpu, structure, pdfanalysis, mathrender, epubbuild, pynvml; print(\"imports ok\")"
-          '
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache

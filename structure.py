@@ -93,6 +93,24 @@ class _TreeBuilder(HTMLParser):
 
 
 _ESCAPED_TAG = re.compile(r"&(?:amp;)*lt;(/?)(sub|sup|i|b|em|strong|u)\s*&(?:amp;)*gt;", re.I)
+# marker flags the first glyph of the escaped tag as a script: "<sup>&amp;</sup>lt;sup&amp;gt;1"
+_SPLIT_ESCAPE = re.compile(r"<(sup|sub)\b[^>]*>\s*(&(?:amp;)*)\s*</\1\s*>((?:amp;)*lt;)", re.I)
+
+
+def _close_scripts(html):
+    """Close a restored <sup>/<sub> whose escaped closing tag OCR lost after its
+    first word, instead of letting it swallow the rest of the block."""
+    parts = re.split(r"(</?(?:sup|sub)\b[^>]*>)", html)
+    for i, part in enumerate(parts):
+        m = re.fullmatch(r"<(sup|sub)\b[^>]*>", part, re.I)
+        if not m:
+            continue
+        tag = m.group(1).lower()
+        nxt = next((p for p in parts[i + 1:] if re.fullmatch(rf"</?{tag}\b[^>]*>", p, re.I)), "")
+        if nxt.lower().startswith(f"</{tag}") or i + 1 >= len(parts):
+            continue
+        parts[i + 1] = re.sub(r"^(\s*[^\s<]{1,8})", rf"\1</{tag}>", parts[i + 1], count=1)
+    return "".join(parts)
 
 
 def restore_tags(html):
@@ -101,9 +119,11 @@ def restore_tags(html):
     (or "&amp;lt;sub&amp;gt;"). Nested duplicates this leaves are flattened when rendering."""
     if not html:
         return html
-    html = _ESCAPED_TAG.sub(lambda m: f"<{m.group(1)}{m.group(2).lower()}>", html)
+    html = _SPLIT_ESCAPE.sub(r"\2\3", html)
+    html, n = _ESCAPED_TAG.subn(lambda m: f"<{m.group(1)}{m.group(2).lower()}>", html)
     # "<sup>&lt;sup&gt;1</sup>" -> "<sup><sup>1</sup>": one tag opened twice, closed once
-    return re.sub(r"<(sup|sub|i|b|em|strong|u)>(\s*<\1>)+", r"<\1>", html)
+    html = re.sub(r"<(sup|sub|i|b|em|strong|u)>(\s*<\1>)+", r"<\1>", html)
+    return _close_scripts(html) if n else html
 
 
 def parse_html(s):

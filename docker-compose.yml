@@ -1,0 +1,37 @@
+services:
+  pdf-converter:
+    build: .
+    container_name: pdf-to-epub-gpu
+    ports:
+      - "7860:7860"
+    shm_size: '8gb'
+
+    environment:
+      # --- GPU sharing (the GPU is checked before every job; nothing is held while idle) ---
+      - GPU_SAFETY_MARGIN_GB=1.0      # VRAM always left free for other processes
+      - MARKER_BASE_VRAM_GB=3.5       # marker weights + CUDA context; tune from the "GPU peak" log line
+      - GPU_WAIT_TIMEOUT_S=900        # how long to wait for a busy GPU before falling back
+      - CPU_FALLBACK=auto             # auto: CPU only for born-digital PDFs | always | never
+      - MARKER_CPU_THREADS=6
+      - MATH_RENDER=svg               # svg (all readers) | mathml
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+      # --- THE ULTIMATE CACHE TRAP ---
+      # Force every single library (Surya, PyTorch, HuggingFace)
+      # to write to our bind mount instead of ephemeral container folders.
+      - HOME=/app/model_cache/home
+      - XDG_CACHE_HOME=/app/model_cache/xdg
+      - HF_HOME=/app/model_cache/huggingface
+      - TORCH_HOME=/app/model_cache/torch
+
+    volumes:
+      - .:/app
+      - ./library:/app/library
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

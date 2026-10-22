@@ -1,0 +1,51 @@
+@namespace epub "http://www.idpf.org/2007/ops";
+/* Conservative e-reader styles: relative units only, no fixed fonts or colours,
+   so reader font/size/theme settings (incl. dark mode) keep working. */
+
+body { orphans: 2; widows: 2; }
+p { margin: 0; text-indent: 1.2em; }
+h1 + p, h2 + p, h3 + p, h4 + p, h5 + p, h6 + p,
+figure + p, .box + p, .table-block + p, .math-display + p { text-indent: 0; }
+h1, h2, h3, h4, h5, h6 { page-break-after: avoid; break-after: avoid; text-indent: 0; line-height: 1.25; }
+h1 { font-size: 1.5em; margin: 1em 0 0.8em; text-align: center; }
+h2 { font-size: 1.25em; margin: 1.4em 0 0.6em; }
+h3 { font-size: 1.1em; margin: 1.2em 0 0.5em; font-style: italic; }
+h4, h5, h6 { font-size: 1em; margin: 1em 0 0.4em; }
+
+/* Figures */
+figure { margin: 1em 0; text-align: center; page-break-inside: avoid; break-inside: avoid; }
+figure img, img.table-image, .table-image img { max-width: 100%; height: auto; }
+figcaption, .table-block > p { font-size: 0.85em; line-height: 1.35; text-align: left;
+  text-indent: 0; margin: 0.4em 0 0.8em; }
+
+/* Info boxes, sidebars */
+.box { margin: 1em 0; padding: 0.6em 0.8em; border: 1px solid currentColor;
+  border-radius: 0.3em; page-break-inside: avoid; break-inside: avoid; }
+.box p { text-indent: 0; margin: 0.3em 0; }
+
+/* Tables: real tables, scroll on readers that allow it, small type for wide ones */
+.table-block { margin: 1em 0; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; margin: 0.5em auto; font-size: 0.85em; }
+.table-wide table { font-size: 0.7em; }
+th, td { border: 1px solid currentColor; padding: 0.15em 0.35em; vertical-align: top; text-indent: 0; }
+th { font-weight: bold; }
+
+/* Math */
+.math-display { display: block; text-align: center; margin: 0.6em 0; text-indent: 0; }
+svg.math-inline { overflow: visible; }
+code.tex { font-size: 0.9em; }
+
+/* References: hanging indent, no first-line indent */
+.references p { text-indent: -1.5em; padding-left: 1.5em; margin: 0 0 0.35em; font-size: 0.9em; }
+
+/* Footnotes (pandoc EPUB3 asides / end notes) */
+aside, .footnotes, section.footnotes { font-size: 0.85em; }
+.footnotes p, aside p { text-indent: 0; }
+a.footnote-ref, a[epub|type="noteref"] { text-decoration: none; }
+.footnote-text { font-size: 0.85em; }
+
+.small { font-size: 0.85em; }
+.underline { text-decoration: underline; }
+.mark { background-color: rgba(255, 230, 0, 0.35); }
+blockquote { margin: 0.8em 1.2em; }

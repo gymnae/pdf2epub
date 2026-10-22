@@ -1,0 +1,10 @@
+# Pinned on purpose: marker 2.x needs Docker-in-Docker + a vLLM server that
+# reserves 85% of VRAM, and scores no better on olmOCR-bench (76.0 vs 76.1 for
+# marker 1.10.1), so the torch-based 1.10 line fits this host better.
+marker-pdf==1.10.2
+surya-ocr==0.17.1
+# NVML bindings: lets the web process check GPU memory without creating a CUDA context.
+nvidia-ml-py
+# torch, transformers, pypdfium2, Pillow come in via marker-pdf. Pin torch and
+# gradio to what `pip freeze` shows in your current, working container.
+gradio

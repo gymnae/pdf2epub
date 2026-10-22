@@ -20,10 +20,12 @@ Everything here is pure Python; `analyzer` (pdfanalysis.PdfAnalyzer) is optional
 """
 import base64
 import contextvars
+import difflib
 import html as htmllib
 import os
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import quote
@@ -90,13 +92,18 @@ class _TreeBuilder(HTMLParser):
         self.stack[-1].children.append(data)
 
 
-_ESCAPED_TAG = re.compile(r"&lt;(/?)(sub|sup|i|b|em|strong|u)\s*&gt;", re.I)
+_ESCAPED_TAG = re.compile(r"&(?:amp;)*lt;(/?)(sub|sup|i|b|em|strong|u)\s*&(?:amp;)*gt;", re.I)
 
 
 def restore_tags(html):
-    """marker sometimes HTML-escapes the formatting tags of OCR'd lines, so
-    "CO<sub>2</sub>" arrives as the literal text "CO&lt;sub&gt;2&lt;/sub&gt;"."""
-    return _ESCAPED_TAG.sub(lambda m: f"<{m.group(1)}{m.group(2).lower()}>", html) if html else html
+    """marker sometimes HTML-escapes the formatting tags of OCR'd lines, once or
+    twice, so "CO<sub>2</sub>" arrives as the literal text "CO&lt;sub&gt;2&lt;/sub&gt;"
+    (or "&amp;lt;sub&amp;gt;"). Nested duplicates this leaves are flattened when rendering."""
+    if not html:
+        return html
+    html = _ESCAPED_TAG.sub(lambda m: f"<{m.group(1)}{m.group(2).lower()}>", html)
+    # "<sup>&lt;sup&gt;1</sup>" -> "<sup><sup>1</sup>": one tag opened twice, closed once
+    return re.sub(r"<(sup|sub|i|b|em|strong|u)>(\s*<\1>)+", r"<\1>", html)
 
 
 def parse_html(s):
@@ -284,10 +291,28 @@ def math_md(tex, display):
 
 # --------------------------------------------------------------------------- links
 
+_TRACKING_PARAM = re.compile(r"^(utm_\w+|enrichid|enrichsource|el|fbclid|gclid|mc_[ce]id|_hs\w+)$", re.I)
+
+
+def clean_href(href):
+    """Drop tracking parameters (utm_*, ResearchGate's enrichId/enrichSource...)."""
+    if "?" not in href:
+        return href
+    base, _, rest = href.partition("?")
+    query, hash_, frag = rest.partition("#")
+    kept = [kv for kv in query.split("&") if kv and not _TRACKING_PARAM.match(kv.split("=", 1)[0])]
+    return base + ("?" + "&".join(kept) if kept else "") + (hash_ + frag)
+
+
 def keep_link(href, text):
-    """marker's link spans drift on many PDFs: keep a link only if its text matches it."""
+    """marker's link spans drift on many PDFs, and repositories add links on
+    reference titles: keep a link only if its visible text is (part of) the
+    address itself, a URL, DOI or e-mail, not a run of words that happens to
+    share a few letters with it."""
     if not href or href.startswith("#"):
         return False
+    if len(text.split()) > 2:
+        return False                  # words, not an address (a URL broken at a line end is 2 parts)
     h = href.lower()
     t = re.sub(r"\s+", "", text.lower()).strip(".,;:()[]")
     if h.startswith("mailto:"):
@@ -357,6 +382,9 @@ class _Ctx:
     styled: bool = False
     heading: bool = False
     stats: dict = None
+    script: str = ""          # inside <sup>/<sub>
+    no_italic: bool = False   # the whole block is italic (rendered as one span)
+    no_bold: bool = False     # the whole block is bold: that is its normal style
 
 
 def _wrap(delim, inner):
@@ -382,6 +410,8 @@ def _text_md(text, ctx):
                 style = ctx.styles.get(re.sub(r"\s+", " ", sm.group(0)))
                 out.append(md_escape(piece[pos:sm.start()]))
                 delim = "*" if style == "italic" else "**"
+                if (style == "italic" and ctx.no_italic) or (style != "italic" and ctx.no_bold):
+                    delim = ""
                 out.append(f"{delim}{md_escape(sm.group(0))}{delim}")
                 if ctx.stats is not None:
                     ctx.stats["styled_runs"] = ctx.stats.get("styled_runs", 0) + 1
@@ -411,11 +441,13 @@ def render_inline(node, ctx):
         return "".join(render_inline(c, sub) for c in node.children)
 
     if tag in ("i", "em"):
-        return _wrap("*", inner(styled=True))
+        return inner() if ctx.no_italic else _wrap("*", inner(styled=True))
     if tag in ("b", "strong"):
-        return inner() if ctx.heading else _wrap("**", inner(styled=True))
+        return inner() if ctx.heading or ctx.no_bold else _wrap("**", inner(styled=True))
     if tag in ("sup", "sub"):
-        content = inner(styled=True).strip()
+        if ctx.script:
+            return inner()            # <sup><sup>1</sup></sup> from double-escaped OCR text
+        content = inner(styled=True, script=tag).strip()
         if not content:
             return ""
         if NOTE_TOKEN.search(content) or "[^" in content:
@@ -430,11 +462,45 @@ def render_inline(node, ctx):
         content = inner()
         href = node.attrs.get("href", "")
         if keep_link(href, plain_text(node)):
-            return f"[{content}]({quote(href, safe=':/?#=&%~+@!$;,()')})"
+            return f"[{content}]({quote(clean_href(href), safe=':/?#=&%~+@!$;,()')})"
         if ctx.stats is not None and href and not href.startswith("#"):
             ctx.stats["links_dropped"] = ctx.stats.get("links_dropped", 0) + 1
         return content
     return inner()
+
+
+def _style_coverage(html, ctx):
+    """(italic, bold) share of a block's characters, from marker's tags and the
+    styles recovered from the PDF fonts. A block that is mostly italic is an
+    italic block (dedication, epigraph); one that is mostly bold is set in a bold
+    body font or is a lead paragraph: either way not a series of emphases."""
+    counts = {"total": 0, "italic": 0, "bold": 0}
+
+    def walk(node, italic, bold):
+        if isinstance(node, str):
+            n = len(re.sub(r"\s+", "", node))
+            counts["total"] += n
+            if italic:
+                counts["italic"] += n
+            if bold:
+                counts["bold"] += n
+            if ctx.style_re is not None and not (italic and bold):
+                for sm in ctx.style_re.finditer(node):
+                    style = ctx.styles.get(re.sub(r"\s+", " ", sm.group(0)))
+                    k = len(re.sub(r"\s+", "", sm.group(0)))
+                    if style == "italic" and not italic:
+                        counts["italic"] += k
+                    elif style == "bold" and not bold:
+                        counts["bold"] += k
+            return
+        if node.tag in ("math", "content-ref", "img"):
+            return
+        for child in node.children:
+            walk(child, italic or node.tag in ("i", "em"), bold or node.tag in ("b", "strong"))
+
+    walk(parse_html(html), False, False)
+    total = counts["total"] or 1
+    return counts["italic"] / total, counts["bold"] / total
 
 
 def inline_md(html, ctx):
@@ -519,6 +585,7 @@ class Item:
     children: list = field(default_factory=list)   # list: li htmls; box: items
     images: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)      # (note_id, html) defined after this item
+    affiliations: list = field(default_factory=list)  # note htmls shown as a block after a byline
     md: str = ""
 
     @property
@@ -543,6 +610,66 @@ def _contained(inner, outer):
     h = max(0.0, min(inner[3], outer[3]) - max(inner[1], outer[1]))
     area = max(1e-9, (inner[2] - inner[0]) * (inner[3] - inner[1]))
     return w * h / area
+
+
+_CANON_MAP = str.maketrans({"‘": "'", "’": "'", "‚": "'", "′": "'", "“": '"', "”": '"', "„": '"', "″": '"',
+                            "–": "-", "—": "-", "−": "-", "‐": "-", "‑": "-", "\u00a0": " "})
+
+
+def _canon(word):
+    """Comparison form: ligatures, quote/dash styles and hyphens do not count."""
+    return unicodedata.normalize("NFKC", fix_text(word)).translate(_CANON_MAP).replace("-", "")
+
+
+def _word_edits(iw, i1, a, b):
+    """Character edits between marker's text `a` (words iw[i1:...]) and the text
+    layer's `b`, as whole-word replacements [(old_word, new_word, nth_occurrence)].
+    Edits that touch only spacing or span two words are left alone."""
+    starts, pos = [], 0
+    for w in a.split(" "):
+        starts.append(pos)
+        pos += len(w) + 1
+    words = a.split(" ")
+    new_words = list(words)
+    for op, x1, x2, y1, y2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal" or not (a[x1:x2] + b[y1:y2]).strip():
+            continue
+        while x2 > x1 and a[x2 - 1] == " ":         # "3 " -> "☺": the space is not the edit
+            x2 -= 1
+        while x1 < x2 and a[x1] == " ":
+            x1 += 1
+        k = max(i for i, st in enumerate(starts) if st <= x1) if x1 < len(a) else len(words) - 1
+        if x2 > starts[k] + len(words[k]) or " " in b[y1:y2].strip():
+            return []                                         # spans words: unsafe
+        off = x1 - starts[k] - (len(words[k]) - len(new_words[k]))
+        new_words[k] = new_words[k][:off] + b[y1:y2].strip() + new_words[k][off + (x2 - x1):]
+    edits = []
+    for k, (old, new) in enumerate(zip(words, new_words)):
+        if old != new and new:
+            nth = sum(1 for w in iw[:i1 + k] if w == old)
+            edits.append((old, new, nth))
+    return edits
+
+
+def _replace_nth_word(html, old, new, nth):
+    """Replace the nth whitespace-delimited occurrence of `old` in the text of
+    `html` (not in tags, not in <math>), if the word count is unambiguous."""
+    pat = re.compile(r"(?<!\S)" + re.escape(htmllib.escape(old, quote=False)) + r"(?=[\s<]|$)")
+    parts = re.split(r"(<[^>]+>)", html)
+    hits, in_math = [], 0
+    for i, part in enumerate(parts):
+        if part.startswith("<"):
+            m = re.match(r"<(/?)math\b", part, re.I)
+            if m:
+                in_math = max(0, in_math + (-1 if m.group(1) else 1))
+            continue
+        if not in_math:
+            hits.extend((i, m.start(), m.end()) for m in pat.finditer(part))
+    if nth >= len(hits):
+        return html, False
+    i, st, en = hits[nth]
+    parts[i] = parts[i][:st] + htmllib.escape(new, quote=False) + parts[i][en:]
+    return "".join(parts), True
 
 
 def _heading_level(html):
@@ -627,6 +754,79 @@ class Converter:
         self.stats[key] = self.stats.get(key, 0) + n
 
     # ---- PDF-assisted repairs
+
+    def _text_layer_fix(self, items):
+        """marker re-reads some lines with OCR even on born-digital pages, which can
+        garble characters ("3" for "☺", "rn" for "m"). Align each block with the PDF
+        text layer and take the text layer's characters where a word differs
+        slightly. Ligatures, quote styles and hyphenation differences are ignored."""
+        if self.an is None:
+            return
+        try:
+            if not self.an.is_born_digital():
+                return
+        except Exception:
+            return
+        by_page = {}
+        for it in items:
+            if it.kind in ("para", "heading", "caption", "list", "footnote"):
+                by_page.setdefault(it.page, []).append(it)
+        for page, its in by_page.items():
+            try:
+                words = [fix_text(w) for w in self.an.page_words(page)]
+            except Exception:
+                continue
+            if not words:
+                continue
+            page_text = " ".join(words)
+            page_canon = [_canon(w) for w in words]
+            for it in its:
+                iw = it.text.split()
+                if not iw:
+                    continue
+                item_canon = [_canon(w) for w in iw]
+                # Anchor at the longest exact run, then align only around it: short
+                # blocks of common words would otherwise match anywhere on the page.
+                anchor = difflib.SequenceMatcher(None, item_canon, page_canon, autojunk=False).find_longest_match(
+                    0, len(item_canon), 0, len(page_canon))
+                if anchor.size < max(2, 0.3 * len(iw)):
+                    continue
+                j0 = max(0, anchor.b - anchor.a - 3)
+                j1 = min(len(words), anchor.b + len(iw) - anchor.a + 3)
+                sm = difflib.SequenceMatcher(None, item_canon, page_canon[j0:j1], autojunk=False)
+                for op, i1, i2, j1_, j2_ in sm.get_opcodes():
+                    j1, j2 = j0 + j1_, j0 + j2_
+                    if op != "replace" or i2 - i1 > 3:
+                        continue
+                    if i1 == 0 or i2 == len(iw):
+                        # At the block's edges the window's context words join the edit:
+                        # take the adjacent run of page words that matches best.
+                        target = "".join(item_canon[i1:i2])
+                        runs = [(j2 - k, j2) if i1 == 0 else (j1, j1 + k) for k in range(1, min(4, j2 - j1) + 1)]
+                        j1, j2 = max(runs, key=lambda r: difflib.SequenceMatcher(
+                            None, target, "".join(page_canon[r[0]:r[1]])).ratio())
+                    if j2 - j1 > 3:
+                        continue
+                    a, b = " ".join(iw[i1:i2]), " ".join(words[j1:j2])
+                    if re.search(r"[\\^_{}$]", a) or re.search(r"[\ufffd\ue000-\uf8ff]", b) or a in page_text:
+                        continue
+                    ca, cb = _canon(a).replace(" ", ""), _canon(b).replace(" ", "")
+                    if not ca or not cb or ca == cb:
+                        continue
+                    if re.sub(r"[\W_]", "", ca) == re.sub(r"[\W_]", "", cb) and re.sub(r"[\W_]", "", ca):
+                        continue          # punctuation only (block edges, marker's own spacing)
+                    same_len_typo = len(ca) == len(cb) and sum(x != y for x, y in zip(ca, cb)) <= max(1, len(ca) // 4)
+                    if not same_len_typo and difflib.SequenceMatcher(None, ca, cb).ratio() < 0.6:
+                        continue
+                    for old, new, nth in _word_edits(iw, i1, a, b):
+                        it.html, done = _replace_nth_word(it.html, old, new, nth)
+                        if it.kind == "list" and not done:
+                            for k, li in enumerate(it.children):
+                                it.children[k], done = _replace_nth_word(li, old, new, 0)
+                                if done:
+                                    break
+                        if done:
+                            self._count("text_layer_corrections")
 
     @staticmethod
     def _apply_scripts(html, patterns):
@@ -734,19 +934,25 @@ class Converter:
         structural formulas in books) and stay."""
         small = lambda it: (it.kind == "figure" and it.caption is None
                             and (it.bbox[2] - it.bbox[0]) * (it.bbox[3] - it.bbox[1]) < DECORATION_MAX_AREA)
-        spot = lambda it: tuple(round(v, 2) for v in it.bbox)
+        # Size and height on the page, not x: running logos alternate left/right.
+        spot = lambda it: (round(it.bbox[2] - it.bbox[0], 2), round(it.bbox[3] - it.bbox[1], 2), round(it.bbox[1], 2))
         first_page = min((it.page for it in items), default=0)
         spots = {}
         for it in items:
             if small(it):
                 spots.setdefault(spot(it), set()).add(it.page)
-        out = []
+        out, dropped = [], []
         for it in items:
-            if small(it) and (it.page == first_page or len(spots[spot(it)]) >= 3):
+            if small(it) and (it.page == first_page or len(spots[spot(it)]) >= 3
+                              or it.bbox[3] < 0.12 or it.bbox[1] > 0.88):     # header/footer art
                 self._count("decorations_dropped")
+                dropped.append(it)
                 continue
             out.append(it)
-        return out
+        # Text that is part of a logo ("HP TODAY") goes with it.
+        grow = lambda b: (b[0] - 0.01, b[1] - 0.01, b[2] + 0.01, b[3] + 0.01)
+        return [it for it in out if not (it.kind in ("para", "heading") and any(
+            d.page == it.page and _contained(it.bbox, grow(d.bbox)) >= 0.7 for d in dropped))]
 
     def _index_texts(self, items):
         for it in items:
@@ -814,12 +1020,15 @@ class Converter:
         repeated = {k for k, pages in pages_of.items() if len(pages) >= threshold}
         # Books change running heads per chapter: in the page margins, three pages suffice.
         repeated_margin = {k for k, pages in pages_of.items() if len(pages) >= 3}
+        # ...and then its other occurrences too (e.g. a journal logo's text on the title page).
+        margin_keys = {key(it) for it in items if it.kind in ("para", "heading") and self._in_margin(it)}
         out = []
         for it in items:
             if it.kind in ("para", "heading"):
                 text = it.text
                 sentence = text.endswith(".") and len(text.split()) >= 5
-                boilerplate = ((key(it) in repeated_margin and self._in_margin(it))
+                boilerplate = ((key(it) in repeated_margin and (self._in_margin(it) or (
+                                   key(it) in margin_keys and len(text) <= 60)))
                                or (key(it) in repeated and len(pages_of[key(it)]) >= 0.5 * self.page_count
                                    and not sentence))
                 page_number = self._in_margin(it) and re.fullmatch(r"(page\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?", text, re.I)
@@ -917,8 +1126,17 @@ class Converter:
         note_seq = 0
         linked = unlinked = 0
         first_page = min((it.page for it in flat), default=0)
+        byline = max((c for c in flat if c.page == first_page and c.kind == "para"),
+                     key=lambda c: c.html.count("<sup>"), default=None)
         for idx, note in enumerate(list(flat)):
             if note.kind != "footnote":
+                continue
+            if note.page == first_page and AFFILIATION.search(note.text) and byline is not None:
+                # Affiliations / correspondence: a small block under the author line reads
+                # better on an e-reader than a row of note links.
+                byline.affiliations.append(note.html)
+                note.kind = "consumed"
+                self._count("affiliations")
                 continue
             html = note.html
             m = re.match(r"\s*(?:<p[^>]*>)?\s*(?:<sup>\s*([^<\s]{1,4})\s*</sup>|([" + re.escape(FOOTNOTE_SYMBOLS)
@@ -983,6 +1201,43 @@ class Converter:
         if n:
             cand.html = new
         return bool(n)
+
+    def _heading_styles(self, items):
+        """Heading levels from the PDF's own typography: headings set in the same
+        size and font are one level, larger type ranks higher (marker's levels are
+        often inconsistent: "Introduction" h4, the next section h2). Short one-line
+        paragraphs set in a heading style become headings too (marker misses e.g.
+        italic run-in heads)."""
+        if self.an is None:
+            return
+        cache = {}
+
+        def style(it):
+            if id(it) not in cache:
+                try:
+                    cache[id(it)] = self.an.line_style(it.page, it.text)
+                except Exception:
+                    cache[id(it)] = None
+            return cache[id(it)]
+
+        heads = [it for it in items if it.kind == "heading"]
+        known = [style(h) for h in heads if style(h)]
+        if not heads or len(known) < 0.8 * len(heads):
+            return
+        body = Counter(st for st in (style(it) for it in items if it.kind == "para" and len(it.text) > 200) if st)
+        body_style = body.most_common(1)[0][0] if body else None
+        first_seen = {}
+        for st in known:
+            first_seen.setdefault(st, len(first_seen))
+        classes = sorted(first_seen, key=lambda st: (-st[0], -st[2], first_seen[st]))
+        rank = {st: i + 1 for i, st in enumerate(classes)}
+        for h in heads:
+            h.level = rank.get(style(h), len(classes) + 1)
+        for it in items:
+            if (it.kind == "para" and len(it.text) <= 100 and not re.search(r"[.,;:]$", it.text)
+                    and style(it) in rank and style(it) != body_style):
+                it.kind, it.level = "heading", rank[style(it)]
+                self._count("headings_promoted")
 
     def _heading_levels(self, items):
         heads = [it for it in items if it.kind == "heading"]
@@ -1108,13 +1363,29 @@ class Converter:
     def _render(self, it, in_box=False):
         ctx = self._ctx(it.page)
         if it.kind == "heading":
-            text = inline_md(it.html, self._ctx(it.page, heading=True))
+            hctx = self._ctx(it.page, heading=True)
+            if _style_coverage(it.html, hctx)[0] >= 0.6:
+                hctx = _Ctx(**{**hctx.__dict__, "no_italic": True})   # an italic heading style, not emphasis
+            text = inline_md(it.html, hctx)
             text = re.sub(r"^\\?\(\s*([a-zA-Z]|[ivx]+|\d+)\s*\)", r"(\1)", text)
             if in_box:
                 return f"**{text}**"
             return "#" * it.level + " " + text
         if it.kind in ("para", "equation", "caption"):
+            italic, bold = _style_coverage(it.html, ctx)
+            if self.an is not None and len(it.text) >= 20:
+                try:
+                    from_pdf = self.an.block_styles(it.page, it.text)
+                except Exception:
+                    from_pdf = None
+                if from_pdf:
+                    italic, bold = max(italic, from_pdf[0]), max(bold, from_pdf[1])
+            if italic >= 0.6 or bold >= 0.6:
+                ctx = _Ctx(**{**ctx.__dict__, "no_italic": italic >= 0.6, "no_bold": bold >= 0.6})
+                self._count("blocks_style_normalised")
             md = escape_line_start(inline_md(it.html, ctx))
+            if italic >= 0.6 and md:
+                md = f"[{md}]{{.italic}}"
             return md
         if it.kind == "footnote":   # left over when nothing could be anchored
             return "::: {.footnote-text}\n" + escape_line_start(inline_md(it.html, ctx)) + "\n:::"
@@ -1170,6 +1441,10 @@ class Converter:
         return "::: {.table-block}\n" + "\n\n".join(parts) + "\n:::"
 
     def _with_notes(self, it, md):
+        if it.affiliations:
+            ctx = self._ctx(it.page)
+            block = "\n\n".join(escape_line_start(inline_md(h, ctx)) for h in it.affiliations)
+            md += "\n\n::: {.affiliations}\n" + block + "\n:::"
         if not it.notes:
             return md
         defs = []
@@ -1250,6 +1525,7 @@ class Converter:
 
     def _convert(self, items):
         items = self._drop_noise(items)
+        self._text_layer_fix(items)
         self._scripts(items)
         items = self._drop_caps(items)
         items = self._figures_and_captions(items)
@@ -1259,6 +1535,7 @@ class Converter:
         items = self._page_notes(items)
         items = self._footnotes(items)
         self._index_texts(items)
+        self._heading_styles(items)
         self._heading_levels(items)
         # Journal lines etc. printed above the title would otherwise become a
         # chapter of their own (pandoc splits at headings): move them below it.
@@ -1273,7 +1550,7 @@ class Converter:
                 blocks.append([it, md])
         blocks = self._merge_continuations(blocks)
 
-        out, in_refs = [], False
+        out, in_refs, ref_open = [], False, False
         for it, md in blocks:
             if it.kind == "heading":
                 if in_refs:
@@ -1284,8 +1561,19 @@ class Converter:
                     out.append("::: {.references}")
                     in_refs = True
                 continue
-            if in_refs and it.kind == "list":
-                md = "\n\n".join(escape_line_start(line[2:]) for line in md.split("\n"))
+            if in_refs and it.kind in ("list", "para") and not it.notes:
+                entries = [escape_line_start(line[2:]) for line in md.split("\n")] if it.kind == "list" else [md]
+                for entry in entries:
+                    head = _unescape_md(entry).lstrip("*_[")
+                    if ref_open and (head[:1].islower() or _unescape_md(out[-1]).endswith(("/", "-"))):
+                        # "... the science of" | "hydrology. Water Resources ..." (column break)
+                        out[-1] += ("" if out[-1].endswith(("/", "-")) else " ") + entry
+                        self._count("references_rejoined")
+                    else:
+                        out.append(entry)
+                    ref_open = not re.search(r"[.)\]]\**$", _unescape_md(out[-1]).rstrip())
+                continue
+            ref_open = False
             out.append(self._with_notes(it, md))
         if in_refs:
             out.append(":::")

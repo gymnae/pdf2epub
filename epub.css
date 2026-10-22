@@ -53,3 +53,7 @@ a.footnote-ref, a[epub|type="noteref"] { text-decoration: none; }
 .underline { text-decoration: underline; }
 .mark { background-color: rgba(255, 230, 0, 0.35); }
 blockquote { margin: 0.8em 1.2em; }
+
+/* Whole italic blocks (dedications, epigraphs), affiliations under the byline */
+.italic { font-style: italic; }
+.affiliations p { font-size: 0.8em; text-indent: 0; margin: 0 0 0.2em; }

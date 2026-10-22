@@ -64,6 +64,7 @@ class PdfAnalyzer:
         self._body_style = None
         self._page_text = {}
         self._glyph_cache = {}
+        self._body_font = ""
 
     def close(self):
         try:
@@ -100,8 +101,8 @@ class PdfAnalyzer:
     # ---------------------------------------------------- glyph-level text
 
     def _glyphs(self, index):
-        """[(char, generated, height, origin_x, origin_y, right, (l, b, r, t))] in text
-        order, PDF user space. Height is the loose (font ascent-descent) box, so it
+        """[(char, generated, height, origin_x, origin_y, right, (l, b, r, t), font, weight)]
+        in text order, PDF user space. Height is the loose (font ascent-descent) box, so it
         tracks the effective font size even where FPDFText_GetFontSize ignores the
         text matrix."""
         if index in self._glyph_cache:
@@ -109,13 +110,17 @@ class PdfAnalyzer:
         tp = self.pdf[index].get_textpage()
         out = []
         x, y = ctypes.c_double(), ctypes.c_double()
+        name_buf, flags = ctypes.create_string_buffer(128), ctypes.c_int()
         for i in range(tp.count_chars()):
             code = pdfium_c.FPDFText_GetUnicode(tp.raw, i)
             ch = chr(code) if 0 < code < 0x110000 else ""
             gen = pdfium_c.FPDFText_IsGenerated(tp.raw, i) == 1
             l, b, r, t = tp.get_charbox(i, loose=True)
             pdfium_c.FPDFText_GetCharOrigin(tp.raw, i, ctypes.byref(x), ctypes.byref(y))
-            out.append((ch, gen, t - b, x.value, y.value, r, (l, b, r, t)))
+            n = pdfium_c.FPDFText_GetFontInfo(tp.raw, i, name_buf, 128, ctypes.byref(flags))
+            font = _font_base(name_buf.value.decode("latin1", "replace")) if n else ""
+            out.append((ch, gen, t - b, x.value, y.value, r, (l, b, r, t), font,
+                        pdfium_c.FPDFText_GetFontWeight(tp.raw, i)))
         self._glyph_cache[index] = out
         if len(self._glyph_cache) > 4:            # passes revisit nearby pages; keep a few
             self._glyph_cache.pop(next(iter(self._glyph_cache)))
@@ -326,6 +331,7 @@ class PdfAnalyzer:
                 slant, ink = self._font_cache.get(key, (None, None))
                 if slant is not None and ink is not None:
                     body = (slant, ink)
+                    self._body_font = key.split("+")[-1]
                     break
             self._body_style = body or (0.0, None)
         return self._body_style
@@ -344,9 +350,13 @@ class PdfAnalyzer:
             if len(phrase) < 2 or not re.search(r"\w\w", phrase):
                 continue
             base = key.split("+")[-1]
-            if ITALIC_NAME.search(base) or (slant is not None and slant - (body_slant or 0) > ITALIC_SLANT_DELTA):
+            # Relative to the body font: some PDFs set all running text in a bold
+            # (or italic) font, and then that is the normal style, not emphasis.
+            if ((ITALIC_NAME.search(base) and not ITALIC_NAME.search(self._body_font))
+                    or (slant is not None and slant - (body_slant or 0) > ITALIC_SLANT_DELTA)):
                 found["italic"][phrase] += 1
-            elif BOLD_NAME.search(base) or (ink is not None and body_ink and ink / body_ink > BOLD_INK_RATIO):
+            elif ((BOLD_NAME.search(base) and not BOLD_NAME.search(self._body_font))
+                  or (ink is not None and body_ink and ink / body_ink > BOLD_INK_RATIO)):
                 found["bold"][phrase] += 1
         page_text = re.sub(r"\s+", " ", self.page_text(index))
         result = {}
@@ -360,6 +370,64 @@ class PdfAnalyzer:
         return result
 
     # ------------------------------------------------------- figure extents
+
+    def line_style(self, index, text):
+        """(size_pt, font, weight) of the PDF line where `text` starts, or None.
+        Size is the median glyph height (half-point steps), font the one used by
+        most of its glyphs, so headings of one class share a key."""
+        want = _norm(text)[:12]
+        if len(want) < 3:
+            return None
+        cur, styles = [], []
+        for g in self._glyphs(index) + [("\n", True, 0, 0, 0, 0, None, "", 0)]:
+            if g[0] in ("\r", "\n"):
+                line = "".join(x[0] for x in cur)
+                norm = _norm(line)
+                if norm and (norm.startswith(want) or (len(norm) >= 3 and want.startswith(norm))):
+                    glyphs = [x for x in cur if x[0].strip() and x[2] > 0 and not x[1]]
+                    if glyphs:
+                        size = round(statistics.median(x[2] for x in glyphs) * 2) / 2
+                        font, _ = Counter(x[7] for x in glyphs).most_common(1)[0]
+                        weight = Counter(x[8] for x in glyphs).most_common(1)[0][0]
+                        styles.append((size, font, weight))
+                cur = []
+                continue
+            cur.append(g)
+        return styles[0] if len(styles) == 1 else None      # ambiguous: several matches
+
+    def block_styles(self, index, text):
+        """(italic, bold) share of the glyphs that set `text` on the page, judged
+        against the body font (a bold body font is normal, not bold). None if the
+        text cannot be located unambiguously."""
+        self._body_metrics()
+        glyphs = [g for g in self._glyphs(index) if not g[1] and g[0].strip()]
+        stream = "".join(_norm(g[0]) or "\x00" for g in glyphs)
+        want = _norm(text)
+        if len(want) < 8 or len(stream) != len(glyphs):
+            return None
+        start = stream.find(want[:24])
+        if start < 0 or stream.find(want[:24], start + 1) >= 0:
+            return None
+        span = glyphs[start:start + len(want)]
+        body = self._body_font
+        slants = {_font_base(key): m for key, m in self._font_cache.items() if m}
+        body_slant = (self._body_style or (0.0, None))[0] or 0.0
+        italic = bold = 0
+        for g in span:
+            font = g[7]
+            slant = (slants.get(font) or (None, None))[0]
+            if ((ITALIC_NAME.search(font) and not ITALIC_NAME.search(body))
+                    or (slant is not None and slant - body_slant > ITALIC_SLANT_DELTA)):
+                italic += 1
+            if BOLD_NAME.search(font) and not BOLD_NAME.search(body):
+                bold += 1
+        return italic / len(span), bold / len(span)
+
+    def page_words(self, index):
+        """Words of the text layer, soft hyphens and their line breaks removed."""
+        text = "".join(g[0] for g in self._glyphs(index))
+        text = re.sub(r"[\ufffe\x02]\s*", "", text)
+        return text.split()
 
     def text_lines(self, index):
         """[(rect, chars, text)] per text line (rotated text yields one entry per glyph)."""
@@ -464,65 +532,116 @@ class PdfAnalyzer:
 
         g = max(1, round(gap_pt * pw / W))
 
-        def bands_of(box):
-            """Ink rows inside `box`, split where >= the gap of blank rows separates them."""
+        def bands_of(box, axis):
+            """Ink bands inside `box` along an axis (1: rows, 0: columns), split
+            where >= the gap of blank lines separates them."""
+            lo, hi = box[axis], box[axis + 2]
             bands, start, blank = [], None, 0
-            for y in range(box[1], box[3]):
-                if mask.crop((box[0], y, box[2], y + 1)).getbbox():
+            for v in range(lo, hi):
+                strip = (box[0], v, box[2], v + 1) if axis == 1 else (v, box[1], v + 1, box[3])
+                if mask.crop(strip).getbbox():
                     if start is None:
-                        start = y
+                        start = v
                     blank = 0
                 elif start is not None:
                     blank += 1
                     if blank >= g:
-                        bands.append((box[0], start, box[2], y - blank + 1))
+                        bands.append((start, v - blank + 1))
                         start, blank = None, 0
             if start is not None:
-                bands.append((box[0], start, box[2], box[3] - blank))
-            return bands
+                bands.append((start, hi - blank))
+            return [(box[0], a, box[2], b) if axis == 1 else (a, box[1], b, box[3]) for a, b in bands]
 
-        def core(box, rivals):
-            """Ink inside `box`, without slivers cut off at its top/bottom edge (the
-            border of a neighbouring table, a caption's last line) and, where a rival
-            box overlaps, only the band that belongs to `box` rather than to them."""
+        def core(box, rivals, trim=True):
+            """Ink inside `box` without slivers cut off at its edges (the border of a
+            neighbouring table above or beside it, a caption's last line) and, where a
+            rival box overlaps, only the part that belongs to `box` rather than to them."""
             found = ink(box)
-            if found is None:
-                return None
-            bands = bands_of(found)
-            if len(bands) > 1:
-                total = found[3] - found[1]
-                kept = [b for b in bands if not ((b[1] <= box[1] + 2 or b[3] >= box[3] - 2)
-                                                 and b[3] - b[1] < 0.2 * total)]
-                bands = kept or bands
-            rivals = [r for r in rivals if _intersection(r, box) > 0]
-            if rivals:
-                score = lambda b: _intersection(b, box) - max(_intersection(b, r) for r in rivals)
-                bands = [max(bands, key=score)]
-            union = bands[0]
-            for b in bands[1:]:
-                union = _union(union, b)
-            return ink(union) or found
+            near = (box[0] - g, box[1] - g, box[2] + g, box[3] + g)
+            rivals = [r for r in rivals if _intersection(r, near) > 0]
+
+            def continues_into_rival(b, axis):
+                """The band touches an edge of `box` and its ink runs on, without a
+                gap, into a rival's box beyond that edge: it is the rival's."""
+                for at_start in (True, False):
+                    edge = box[axis] if at_start else box[axis + 2]
+                    if abs((b[axis] if at_start else b[axis + 2]) - edge) > 2:
+                        continue
+                    lo, hi = (edge - g, edge) if at_start else (edge, edge + g)
+                    strip = (b[0], lo, b[2], hi) if axis == 1 else (lo, b[1], hi, b[3])
+                    for r in rivals:
+                        part = (max(strip[0], r[0]), max(strip[1], r[1]), min(strip[2], r[2]), min(strip[3], r[3]))
+                        if part[2] > part[0] and part[3] > part[1] and ink(part):
+                            return True
+                return False
+
+            for axis in (1, 0):                      # rows, then columns
+                if found is None:
+                    return None
+                bands = bands_of(found, axis)
+                if rivals and len(bands) > 1:
+                    bands = [b for b in bands if not continues_into_rival(b, axis)] or bands
+                if trim and len(bands) > 1:
+                    total = found[axis + 2] - found[axis]
+                    at_edge = lambda b: b[axis] <= box[axis] + 2 or b[axis + 2] >= box[axis + 2] - 2
+                    kept = [b for b in bands if not (at_edge(b) and b[axis + 2] - b[axis] < 0.2 * total)]
+                    bands = kept or bands
+                if rivals:
+                    score = lambda b: _intersection(b, box) - max(_intersection(b, r) for r in rivals)
+                    bands = [b for b in bands if score(b) > 0.25 * _area(b)] or [max(bands, key=score)]
+                union = bands[0]
+                for b in bands[1:]:
+                    union = _union(union, b)
+                found = ink(union) or found
+            return found
 
         own = px(rect)
         rivals = [px(o) for o in others]
         cur = core(own, rivals)
         if cur is None:
             return None
-        # Neighbouring figures/tables: their own cores are off limits for growth.
-        barriers = [c for c in (core(r, [own]) for r in rivals) if c and not _intersection(c, cur)]
-        changed = True
-        while changed:                 # grow one side at a time, never into a neighbour
-            changed = False
-            for side in range(4):
-                probe = list(cur)
-                probe[side] += g if side >= 2 else -g
-                grown = ink(tuple(probe))
-                nxt = _union(cur, grown) if grown else cur
-                if nxt != cur and not any(_intersection(nxt, b) for b in barriers):
-                    cur, changed = nxt, True
-        pad_x, pad_y = 3.0 / W, 3.0 / H
-        return (max(0.0, cur[0] / pw - pad_x), max(0.0, cur[1] / ph - pad_y),
-                min(1.0, cur[2] / pw + pad_x), min(1.0, cur[3] / ph + pad_y))
+        def grow(box, avoid):
+            """Extend `box` side by side by all ink within the gap, never reaching
+            further into any of the `avoid` boxes than it already does."""
+            changed = True
+            while changed:
+                changed = False
+                for side in range(4):
+                    probe = list(box)
+                    probe[side] += g if side >= 2 else -g
+                    grown = ink(tuple(probe))
+                    nxt = _union(box, grown) if grown else box
+                    if nxt != box and not any(_intersection(nxt, a) > _intersection(box, a) for a in avoid):
+                        box, changed = nxt, True
+            return box
+
+        # Neighbouring figures/tables: their full extent (grown like ours, but not
+        # into our start) fences the crop in. On the side where a neighbour lies the
+        # crop stops just before it; the other directions stay free, so a diagram
+        # next to a table can still grow upwards to take in its labels.
+        neighbours = [grow(c, [cur]) for c in (core(r, [own], trim=False) for r in rivals) if c]
+        fence = [region[0], region[1], region[2], region[3]]
+        for c in neighbours:
+            dx = ((c[0] + c[2]) - (cur[0] + cur[2])) / max(1, (c[2] - c[0]) + (cur[2] - cur[0]))
+            dy = ((c[1] + c[3]) - (cur[1] + cur[3])) / max(1, (c[3] - c[1]) + (cur[3] - cur[1]))
+            if abs(dx) >= abs(dy):
+                if dx > 0:
+                    fence[2] = min(fence[2], c[0])
+                else:
+                    fence[0] = max(fence[0], c[2])
+            elif dy > 0:
+                fence[3] = min(fence[3], c[1])
+            else:
+                fence[1] = max(fence[1], c[3])
+        region = tuple(fence)
+        cur = ink(cur)                 # ink() clips to the (fenced) region
+        if cur is None:
+            return None
+        cur = grow(cur, neighbours)
+        pad_x, pad_y = round(3.0 * pw / W), round(3.0 * ph / H)       # 3 pt, but never past a fence
+        cur = (max(region[0], cur[0] - pad_x), max(region[1], cur[1] - pad_y),
+               min(region[2], cur[2] + pad_x), min(region[3], cur[3] + pad_y))
+        return (cur[0] / pw, cur[1] / ph, cur[2] / pw, cur[3] / ph)
 
     # ------------------------------------------------------------------ boxes
 
@@ -596,6 +715,11 @@ def _intersection(a, b):
 def _overlap_fraction(a, b):
     """Fraction of `a` covered by `b`."""
     return _intersection(a, b) / _area(a) if _area(a) else 0.0
+
+
+def _font_base(name):
+    """"ABCDEF+Times-Bold" / "AdvTTec61d777.BI+26" -> the font itself."""
+    return re.sub(r"\+\w{1,3}$", "", re.sub(r"^[A-Z]{6}\+", "", name))
 
 
 def _norm(text):

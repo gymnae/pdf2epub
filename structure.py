@@ -11,7 +11,10 @@ layouts hard to read on an e-reader. This module works on marker's block tree
   * paragraphs that a page break, figure, box or footnote split in two, re-joined,
   * italic/bold recovered from the PDF fonts where marker lost it,
   * consistent heading levels, no publisher cover sheet, no running heads,
-  * only links whose text matches their target (marker's link offsets drift).
+  * only links whose text matches their target (marker's link offsets drift),
+  * sub/superscripts and drop caps that the PDF text layer or marker lost,
+  * figure crops aligned with the page as rendered (CropBox offsets) and kept
+    clear of captions and body text.
 
 Everything here is pure Python; `analyzer` (pdfanalysis.PdfAnalyzer) is optional.
 """
@@ -20,7 +23,9 @@ import contextvars
 import html as htmllib
 import os
 import re
+import statistics
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from urllib.parse import quote
@@ -28,6 +33,9 @@ from urllib.parse import quote
 TABLE_IMAGE_MIN_COLS = int(os.environ.get("TABLE_IMAGE_MIN_COLS", "7"))
 FIGURE_DPI = int(os.environ.get("FIGURE_DPI", "220"))
 FIGURE_MAX_PX = int(os.environ.get("FIGURE_MAX_PX", "1600"))
+# Uncaptioned pictures smaller than this (fraction of the page) are publisher
+# logos, licence badges, "Check for updates" buttons and the like.
+DECORATION_MAX_AREA = float(os.environ.get("DECORATION_MAX_AREA", "0.025"))
 
 PARA_TYPES = {"Text", "TextInlineMath", "Handwriting", "ComplexRegion", "ListItem"}
 IMAGE_TYPES = {"Figure", "Picture"}
@@ -82,6 +90,15 @@ class _TreeBuilder(HTMLParser):
         self.stack[-1].children.append(data)
 
 
+_ESCAPED_TAG = re.compile(r"&lt;(/?)(sub|sup|i|b|em|strong|u)\s*&gt;", re.I)
+
+
+def restore_tags(html):
+    """marker sometimes HTML-escapes the formatting tags of OCR'd lines, so
+    "CO<sub>2</sub>" arrives as the literal text "CO&lt;sub&gt;2&lt;/sub&gt;"."""
+    return _ESCAPED_TAG.sub(lambda m: f"<{m.group(1)}{m.group(2).lower()}>", html) if html else html
+
+
 def parse_html(s):
     tb = _TreeBuilder()
     tb.feed(s or "")
@@ -106,7 +123,8 @@ def html_plain(s):
 _SPACING_ACCENTS = {"¨": "\u0308", "´": "\u0301", "ˆ": "\u0302", "˜": "\u0303", "¸": "\u0327",
                     "˚": "\u030a", "ˇ": "\u030c", "˘": "\u0306", "˙": "\u0307", "˝": "\u030b"}
 _ACCENT_CLASS = "".join(_SPACING_ACCENTS)
-_LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st", "\u00ad": ""}
+_LIGATURES = {"ﬀ": "ff", "ﬁ": "fi", "ﬂ": "fl", "ﬃ": "ffi", "ﬄ": "ffl", "ﬅ": "st", "ﬆ": "st", "\u00ad": "",
+              "\ufffe": ""}  # U+FFFE: pdfium's marker for a soft hyphen at a line break
 
 
 def _compose(base, accent):
@@ -187,12 +205,79 @@ def clean_tex(tex):
     return re.sub(r"\s+", " ", tex).strip()
 
 
+_GREEK = {name: chr(code) for name, code in (
+    ("alpha", 0x3B1), ("beta", 0x3B2), ("gamma", 0x3B3), ("delta", 0x3B4), ("epsilon", 0x3B5),
+    ("varepsilon", 0x3B5), ("zeta", 0x3B6), ("eta", 0x3B7), ("theta", 0x3B8), ("vartheta", 0x3D1),
+    ("iota", 0x3B9), ("kappa", 0x3BA), ("lambda", 0x3BB), ("mu", 0x3BC), ("nu", 0x3BD), ("xi", 0x3BE),
+    ("pi", 0x3C0), ("rho", 0x3C1), ("sigma", 0x3C3), ("tau", 0x3C4), ("upsilon", 0x3C5), ("phi", 0x3C6),
+    ("varphi", 0x3C6), ("chi", 0x3C7), ("psi", 0x3C8), ("omega", 0x3C9), ("Gamma", 0x393),
+    ("Delta", 0x394), ("Theta", 0x398), ("Lambda", 0x39B), ("Xi", 0x39E), ("Pi", 0x3A0),
+    ("Sigma", 0x3A3), ("Phi", 0x3A6), ("Psi", 0x3A8), ("Omega", 0x3A9))}
+_SIMPLE_SYMBOLS = {**_GREEK, "pm": "±", "mp": "∓", "times": "×", "cdot": "·", "sim": "~", "approx": "≈",
+                   "le": "≤", "leq": "≤", "ge": "≥", "geq": "≥", "neq": "≠", "circ": "°", "degree": "°",
+                   "prime": "′", "permil": "‰", "infty": "∞", "rightarrow": "→", "to": "→",
+                   "leftarrow": "←", "uparrow": "↑", "downarrow": "↓", "%": "%", ",": " ", ";": " ",
+                   ":": " ", "!": "", " ": " ", "{": "{", "}": "}"}
+_SIMPLE_TEXT_CMD = re.compile(r"\\(?:mathrm|text|textrm|mathit|textit|mathbf|textbf|mbox|rm)\s*\{([^{}\\^_]*)\}")
+_SIMPLE_SCRIPT = re.compile(r"([\^_])(?:\{([^{}\^_]*)\}|([^{}\s\^_]))")
+
+
+def simple_math(tex):
+    """Short inline TeX that is really just text with sub/superscripts (CO_2,
+    \\delta^{18}O_{atm}, 25^{\\circ}C, km^2) -> [(kind, text)], kind '', 'sup' or 'sub'.
+    None for anything that needs real math layout. Rendering these as text keeps
+    them in the reader's font and size instead of a fixed-size SVG."""
+    if not tex or len(tex) > 60 or not re.search(r"[\^_]", tex):
+        return None
+    s = _SIMPLE_TEXT_CMD.sub(lambda m: m.group(1).replace(" ", "\x01"), tex)
+    unknown = False
+
+    def symbol(m):
+        nonlocal unknown
+        name = m.group(1)
+        if name not in _SIMPLE_SYMBOLS:
+            unknown = True
+            return ""
+        return _SIMPLE_SYMBOLS[name]
+    s = re.sub(r"\\([A-Za-z]+|[%,;:! {}])\s*", symbol, s)
+    if unknown:
+        return None
+    s = re.sub(r"\^\{?\s*°\s*\}?", "°", s)              # 25^{\circ}C -> 25°C
+    s = re.sub(r"\^\{?\s*′\s*\}?", "′", s)
+    parts, pos = [], 0
+    for m in _SIMPLE_SCRIPT.finditer(s):
+        parts.append(("", s[pos:m.start()]))
+        parts.append(("sup" if m.group(1) == "^" else "sub", m.group(2) if m.group(2) is not None else m.group(3)))
+        pos = m.end()
+    parts.append(("", s[pos:]))
+    out = []
+    for kind, text in parts:
+        if re.search(r"[{}\\^_]", text):
+            return None                                  # nested scripts or leftovers
+        text = re.sub(r"\s+", "", text).replace("\x01", " ")   # spaces in math mode are not text
+        if text:
+            out.append((kind, text))
+    if not out or not all(re.fullmatch(r"[\w\s+\-−–=()\[\],.:;/'′°±∓×·~≈≤≥≠‰∞→←↑↓*|<>%]+", t) for _, t in out):
+        return None
+    return out
+
+
 def math_md(tex, display):
     tex = clean_tex(tex)
     if not tex:
         return ""
     if _looks_like_text(tex):
         return md_escape(fix_text(_plainify_tex(tex)))
+    simple = None if display else simple_math(tex)
+    if simple:
+        out = []
+        for kind, text in simple:
+            text = md_escape(text)
+            if kind:
+                delim = "^" if kind == "sup" else "~"
+                text = delim + text.replace(" ", "\\ ") + delim
+            out.append(text)
+        return "".join(out)
     tex = tex.replace("$", r"\$")
     return f"$${tex}$$" if display else f"${tex}$"
 
@@ -374,6 +459,10 @@ def safe_html(node):
     if tag not in _TABLE_TAGS:
         return inner
     if tag == "math":
+        simple = None if node.attrs.get("display") == "block" else simple_math(clean_tex(plain_text(node)))
+        if simple:
+            return "".join(f"<{k}>{htmllib.escape(t, quote=False)}</{k}>" if k else htmllib.escape(t, quote=False)
+                           for k, t in simple)
         return f'<math display="{htmllib.escape(node.attrs.get("display") or "inline")}">' \
                f"{htmllib.escape(clean_tex(plain_text(node)), quote=False)}</math>"
     if tag == "br":
@@ -472,6 +561,8 @@ class Converter:
         self.title = None
         self._style_cache = {}
         self._fig_count = 0
+        self._shift = {}         # page -> (dx, dy): marker frame -> rendered-page frame
+        self._page_texts = {}    # page -> [(kind, bbox)] of text blocks, for figure crops
 
     # ---- collection
 
@@ -489,7 +580,7 @@ class Converter:
 
     def _from_block(self, blk, pnum, pb):
         bt = blk.get("block_type", "")
-        html = blk.get("html") or ""
+        html = restore_tags(blk.get("html") or "")
         bbox = _norm_bbox(blk.get("bbox") or pb, pb)
         kids = blk.get("children") or []
         if bt in DROP_TYPES:
@@ -501,7 +592,7 @@ class Converter:
                 if main is None and kt in IMAGE_TYPES | {"Table", "Form"}:
                     main = self._from_block(k, pnum, pb)
                 elif kt == "Caption":
-                    captions.append(k.get("html") or "")
+                    captions.append(restore_tags(k.get("html") or ""))
                 else:
                     rest.extend(self._from_block(k, pnum, pb))
             if not main:
@@ -511,7 +602,7 @@ class Converter:
                 head.caption = Item("caption", pnum, bbox, " ".join(captions), "Caption")
             return main + rest
         if bt == "ListGroup":
-            lis = [k.get("html") or "" for k in kids] or [html]
+            lis = [restore_tags(k.get("html") or "") for k in kids] or [html]
             return [Item("list", pnum, bbox, " ".join(lis), bt, children=lis)]
         if kids and bt not in PARA_TYPES | IMAGE_TYPES | {"Table", "Form", "Caption", "Footnote",
                                                          "SectionHeader", "Equation", "Code"}:
@@ -531,6 +622,203 @@ class Converter:
         if not item.text and kind != "equation":
             return []
         return [item]
+
+    def _count(self, key, n=1):
+        self.stats[key] = self.stats.get(key, 0) + n
+
+    # ---- PDF-assisted repairs
+
+    def _to_pdf(self, page, rect):
+        dx, dy = self._shift.get(page, (0.0, 0.0))
+        return (rect[0] + dx, rect[1] + dy, rect[2] + dx, rect[3] + dy)
+
+    def _from_pdf(self, page, rect):
+        dx, dy = self._shift.get(page, (0.0, 0.0))
+        return (rect[0] - dx, rect[1] - dy, rect[2] - dx, rect[3] - dy)
+
+    def _calibrate(self, items):
+        """On PDFs whose CropBox sits inside a larger MediaBox, marker's boxes can be
+        off by the CropBox origin, so figure crops cut off one side and pull in the
+        caption. Check paragraph starts against the PDF text layer and remember the
+        shift that lines them up (none, +offset or -offset)."""
+        if self.an is None:
+            return
+        paras = {}
+        for it in items:
+            if it.kind == "para" and len(it.text) >= 30:
+                paras.setdefault(it.page, []).append(it)
+        votes = Counter()
+        for page, its in paras.items():
+            try:
+                ox, oy = self.an.frame_offset(page)
+            except Exception:
+                continue
+            if abs(ox) < 0.01 and abs(oy) < 0.01:
+                continue
+            pts = []
+            for it in its[:12]:
+                snippet = " ".join(it.text.split()[:4])
+                if len(snippet) < 12:
+                    continue
+                try:
+                    box = self.an.locate(page, snippet)
+                except Exception:
+                    box = None
+                if box:
+                    pts.append((it.bbox, box))
+            if len(pts) < 2:
+                continue
+            err = {sign: statistics.median(abs(b[0] - a[0] - sign * ox) + abs(b[1] - a[1] - sign * oy)
+                                           for a, b in pts) for sign in (0, 1, -1)}
+            best = min(err, key=err.get)
+            votes[best if best and err[best] < 0.5 * err[0] else 0] += 1
+        sign = votes.most_common(1)[0][0] if votes else 0
+        if not sign:
+            return
+        for page in range(self.page_count):
+            try:
+                ox, oy = self.an.frame_offset(page)
+            except Exception:
+                continue
+            if abs(ox) >= 0.01 or abs(oy) >= 0.01:
+                self._shift[page] = (sign * ox, sign * oy)
+        self._count("frame_offset_pages", len(self._shift))
+
+    @staticmethod
+    def _apply_scripts(html, patterns):
+        parts = re.split(r"(<[^>]+>)", html)
+        depth, hits = 0, 0
+        for i, part in enumerate(parts):
+            if part.startswith("<"):
+                m = re.match(r"<(/?)(sup|sub|math)\b", part, re.I)
+                if m:
+                    depth = max(0, depth + (-1 if m.group(1) else 1))
+                continue
+            if depth or not part:
+                continue
+            for pattern, kind in patterns:
+                part, n = pattern.subn(lambda m: f"{m.group(1)}<{kind}>{m.group(2)}</{kind}>", part)
+                hits += n
+            parts[i] = part
+        return "".join(parts), hits
+
+    def _scripts(self, items):
+        """Sub/superscripts flattened by the text layer ("CO2", "model36", "km2")."""
+        if self.an is None:
+            return
+        cache = {}
+
+        def patterns(page):
+            if page not in cache:
+                try:
+                    runs = self.an.script_runs(page)
+                except Exception:
+                    runs = []
+                pats = []
+                for prefix, run, kind in sorted(runs, key=lambda r: -len(r[0] + r[1])):
+                    tail = r"(?!\d)" if run[-1].isdigit() else r"(?![^\W\d_])" if run[-1].isalpha() else ""
+                    pats.append((re.compile("(" + re.escape(prefix) + ") ?(" + re.escape(run) + ")" + tail), kind))
+                cache[page] = pats
+            return cache[page]
+
+        def fix(it):
+            pats = patterns(it.page)
+            if not pats:
+                return
+            it.html, n = self._apply_scripts(it.html, pats)
+            if it.kind == "list":
+                fixed = [self._apply_scripts(li, pats) for li in it.children]
+                it.children = [li for li, _ in fixed]
+                n += sum(k for _, k in fixed)
+            if n:
+                self._count("scripts_recovered", n)
+
+        for it in items:
+            if it.kind in ("para", "heading", "list", "caption", "footnote", "table"):
+                fix(it)
+            if it.caption is not None:
+                fix(it.caption)
+
+    def _drop_caps(self, items):
+        """Drop caps marker lost: "lobal water scarcity..." -> "Global water scarcity..."."""
+        if self.an is None:
+            return items
+        for page in sorted({it.page for it in items if it.kind == "para"}):
+            try:
+                caps = self.an.drop_caps(page)
+            except Exception:
+                continue
+            for letter, follow in caps:
+                head = follow[:6]
+                target = next((it for it in items if it.page == page and it.kind == "para"
+                               and it.text.startswith(head)), None)
+                if target is None:
+                    continue
+                target.html = re.sub(r"^((?:\s*<[^>]+>)*\s*)", lambda m: m.group(1) + letter, target.html, count=1)
+                # marker sometimes keeps the initial as a block of its own
+                items = [it for it in items if not (it.page == page and it.kind == "para" and it.text == letter)]
+                self._count("drop_caps_restored")
+        return items
+
+    def _page_notes(self, items):
+        """Notes at the foot of a page that marker labelled as text ("*email",
+        "One contribution of 10 to...") sit between a paragraph and its continuation
+        on the next page. Turn them into footnotes so the paragraph can be re-joined."""
+        for idx in range(1, len(items)):
+            prev = items[idx - 1]
+            if prev.kind != "para" or not self._ends_open(prev.text):
+                continue
+            run, j = [], idx
+            while j < len(items):
+                c = items[j]
+                if not (c.kind == "para" and c.page == prev.page and c.bbox[1] >= max(0.75, prev.bbox[3] - 0.01)
+                        and len(c.text) < 400 and min(c.bbox[2], prev.bbox[2]) > max(c.bbox[0], prev.bbox[0])):
+                    break
+                run.append(c)
+                j += 1
+            nxt = items[j] if j < len(items) else None
+            if run and nxt is not None and nxt.kind == "para" and nxt.text[:1].islower():
+                for c in run:
+                    c.kind = "footnote"
+                self._count("page_notes_detected", len(run))
+        return items
+
+    def _drop_decorations(self, items):
+        out = []
+        for it in items:
+            x0, y0, x1, y1 = it.bbox
+            if it.kind == "figure" and it.caption is None and (x1 - x0) * (y1 - y0) < DECORATION_MAX_AREA:
+                self._count("decorations_dropped")
+                continue
+            out.append(it)
+        return out
+
+    def _index_texts(self, items):
+        for it in items:
+            for t in ([it] + (it.children if it.kind == "box" else [])):
+                if isinstance(t, Item) and t.kind in ("para", "heading", "list", "caption", "footnote", "equation"):
+                    self._page_texts.setdefault(t.page, []).append((t.kind, t.bbox))
+            if it.caption is not None:
+                self._page_texts.setdefault(it.caption.page, []).append(("caption", it.caption.bbox))
+
+    def _figure_rect(self, it):
+        """Shrink a figure's box so that it does not reach into the caption or body
+        text above/below it (marker's boxes often include the caption's first line)."""
+        x0, y0, x1, y1 = it.bbox
+        for kind, tb in self._page_texts.get(it.page, []):
+            if min(x1, tb[2]) - max(x0, tb[0]) <= 0.3 * min(x1 - x0, tb[2] - tb[0]):
+                continue                      # different column
+            if tb[1] >= y1 or tb[3] <= y0:
+                continue                      # no vertical overlap
+            if kind != "caption" and _contained(tb, it.bbox) >= 0.9:
+                continue                      # a label inside the figure
+            if (tb[1] + tb[3]) / 2 > (y0 + y1) / 2:
+                y1 = min(y1, tb[1] - 0.004)
+            else:
+                y0 = max(y0, tb[3] + 0.004)
+        if y1 - y0 < 0.5 * (it.bbox[3] - it.bbox[1]):
+            return it.bbox                    # would cut away most of it: keep marker's box
+        return (x0, y0, x1, y1)
 
     # ---- cleanup passes
 
@@ -621,9 +909,9 @@ class Converter:
         pages = sorted({it.page for it in items})
         for p in pages:
             on_page = [it for it in items if it.page == p]
-            exclude = [it.bbox for it in on_page if it.kind in ("figure", "table")]
+            exclude = [self._to_pdf(p, it.bbox) for it in on_page if it.kind in ("figure", "table")]
             try:
-                rects = self.an.box_regions(p, exclude)
+                rects = [self._from_pdf(p, r) for r in self.an.box_regions(p, exclude)]
             except Exception:
                 continue
             text_items = [it for it in on_page if it.kind in ("para", "heading", "list", "equation")]
@@ -806,7 +1094,8 @@ class Converter:
         if self.an is not None:
             try:
                 from pdfanalysis import encode_image
-                img = self.an.render_region(item.page, rect, dpi=FIGURE_DPI, max_px=FIGURE_MAX_PX)
+                img = self.an.render_region(item.page, self._to_pdf(item.page, rect),
+                                            dpi=FIGURE_DPI, max_px=FIGURE_MAX_PX)
                 if img is not None:
                     data, ext = encode_image(img)
             except Exception:
@@ -858,7 +1147,7 @@ class Converter:
             return f"{fence}\n{code}\n{fence}"
         if it.kind == "figure":
             self._fig_count += 1
-            rel = self._save_image(it, it.bbox, f"p{it.page + 1}_fig{self._fig_count}")
+            rel = self._save_image(it, self._figure_rect(it), f"p{it.page + 1}_fig{self._fig_count}")
             if rel is None:
                 return self._caption_md(it)
             self.stats["figures"] = self.stats.get("figures", 0) + 1
@@ -969,11 +1258,17 @@ class Converter:
             _MATHPI.reset(token)
 
     def _convert(self, items):
+        self._calibrate(items)
         items = self._drop_noise(items)
+        self._scripts(items)
+        items = self._drop_caps(items)
         items = self._figures_and_captions(items)
         items = self._drop_figure_labels(items)
+        items = self._drop_decorations(items)
         items = self._boxes(items)
+        items = self._page_notes(items)
         items = self._footnotes(items)
+        self._index_texts(items)
         self._heading_levels(items)
         # Journal lines etc. printed above the title would otherwise become a
         # chapter of their own (pandoc splits at headings): move them below it.

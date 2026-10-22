@@ -5,11 +5,18 @@ Fills gaps in marker's output:
     even for subset fonts with obfuscated names and empty style flags;
   * info boxes: filled or framed rectangles that contain text;
   * figures: re-renders figure regions as crisp images straight from the PDF;
+  * sub/superscripts that the text layer flattens ("CO2", "model36"), from glyph
+    size and baseline;
+  * drop caps that marker loses;
   * document checks: publisher cover sheets and text-layer quality.
+
+Rectangles are page fractions with a top-left origin, relative to the visible
+(rendered) page area, i.e. the CropBox, not the MediaBox.
 """
 import ctypes
 import io
 import re
+import statistics
 from collections import Counter
 
 import pypdfium2 as pdfium
@@ -29,6 +36,11 @@ BOLD_NAME = re.compile(r"(bold|black|heavy|semibd|[-.,_]b$|[-.,_]bd$|cmbx)", re.
 
 ITALIC_SLANT_DELTA = 0.09   # italic glyphs lean ~0.15-0.25; upright ones ~0 +- 0.08
 BOLD_INK_RATIO = 1.3        # bold strokes cover >= 30% more area than the body font
+
+SCRIPT_SIZE_RATIO = 0.88    # sub/superscript glyphs are <= ~80% of the base glyph height
+SCRIPT_SHIFT_RATIO = 0.12   # ... and their baseline moves by >= ~15% of it
+SCRIPT_CHARS = re.compile(r"[0-9A-Za-z,+\-−–*†‡§¶‖'′=().α-ωΔ]")
+DROP_CAP_RATIO = 1.8        # a drop cap is >= ~2 lines tall
 
 
 def _wide_text(buf_len_fn, fill_fn):
@@ -64,6 +76,133 @@ class PdfAnalyzer:
             tp = self.pdf[index].get_textpage()
             self._page_text[index] = tp.get_text_bounded()
         return self._page_text[index]
+
+    # ------------------------------------------------------------ coordinates
+
+    def _frame(self, index):
+        """(left, top, width, height) of the visible page area in PDF user space."""
+        page = self.pdf[index]
+        left, _, _, top = page.get_bbox()
+        w, h = page.get_size()
+        return left, top, w or 1.0, h or 1.0
+
+    def to_frac(self, index, l, b, r, t):
+        """PDF user-space box -> page fractions (top-left origin, visible area)."""
+        left, top, w, h = self._frame(index)
+        return ((l - left) / w, (top - t) / h, (r - left) / w, (top - b) / h)
+
+    def frame_offset(self, index):
+        """Offset of the visible area inside the MediaBox, as page fractions.
+        Non-zero for e.g. HighWire/Royal Society PDFs, whose CropBox trims an A4
+        MediaBox; tools that mix the two frames place everything off by this much."""
+        page = self.pdf[index]
+        left, top, w, h = self._frame(index)
+        ml, _, _, mt = page.get_mediabox()
+        return (left - ml) / w, (mt - top) / h
+
+    def locate(self, index, snippet):
+        """Box of the first character of `snippet` if it occurs exactly once on the page."""
+        tp = self.pdf[index].get_textpage()
+        searcher = tp.search(snippet, match_case=True)
+        hit = searcher.get_next()
+        if hit is None or searcher.get_next() is not None:
+            return None
+        l, b, r, t = tp.get_charbox(hit[0], loose=True)
+        return self.to_frac(index, l, b, r, t)
+
+    # ---------------------------------------------------- glyph-level text
+
+    def _glyphs(self, index):
+        """[(char, generated, height, origin_x, origin_y, right)] in text order.
+        Height is the loose (font ascent-descent) box, so it tracks the effective
+        font size even where FPDFText_GetFontSize ignores the text matrix."""
+        tp = self.pdf[index].get_textpage()
+        out = []
+        x, y = ctypes.c_double(), ctypes.c_double()
+        for i in range(tp.count_chars()):
+            code = pdfium_c.FPDFText_GetUnicode(tp.raw, i)
+            ch = chr(code) if 0 < code < 0x110000 else ""
+            gen = pdfium_c.FPDFText_IsGenerated(tp.raw, i) == 1
+            l, b, r, t = tp.get_charbox(i, loose=True)
+            pdfium_c.FPDFText_GetCharOrigin(tp.raw, i, ctypes.byref(x), ctypes.byref(y))
+            out.append((ch, gen, t - b, x.value, y.value, r))
+        return out
+
+    def script_runs(self, index):
+        """Sub/superscripts on a page as [(prefix, run, kind)], kind 'sup' or 'sub'.
+
+        prefix is the text directly before the run on the same line (the word it
+        is attached to). Only runs that are *consistently* scripted on the page
+        are returned (every plain-text occurrence of prefix+run is scripted), so
+        applying them to marker's text by string matching is safe."""
+        glyphs = self._glyphs(index)
+        heights = [g[2] for g in glyphs if g[2] > 0 and not g[1] and g[0].strip()]
+        if not heights:
+            return []
+        body_h = statistics.median(heights)
+        found = Counter()
+        i, n = 0, len(glyphs)
+        while i < n:
+            ch, gen, h, x, y, _ = glyphs[i]
+            if gen or not ch.strip() or h <= 0 or h > 1.5 * body_h:
+                i += 1
+                continue
+            # i is a normal-size glyph; is it followed by a scripted run?
+            j = i + 1
+            if j < n and glyphs[j][1] and not glyphs[j][0].strip():
+                j += 1                     # one generated space ("Dolan 1")
+            run, kind, k = [], None, j
+            while k < n:
+                c2, gen2, h2, x2, y2, _ = glyphs[k]
+                dy = y2 - y
+                if (gen2 or h2 <= 0 or h2 > SCRIPT_SIZE_RATIO * h or abs(dy) < SCRIPT_SHIFT_RATIO * h
+                        or abs(dy) > 0.8 * h or not SCRIPT_CHARS.fullmatch(c2 or " ")):
+                    break
+                k_kind = "sup" if dy > 0 else "sub"
+                if kind and k_kind != kind:
+                    break
+                kind = k_kind
+                run.append(c2)
+                k += 1
+            text = "".join(run).strip(",.()")
+            if text and len(run) <= 12 and glyphs[j][3] - glyphs[i][5] < 2 * h:
+                p = i
+                while p > 0 and i - p < 24:
+                    c0, gen0, h0, *_ = glyphs[p - 1]
+                    if gen0 or not c0.strip() or abs(h0 - h) > 0.1 * h or not re.match(r"[\w.\-]", c0):
+                        break
+                    p -= 1
+                prefix = "".join(g[0] for g in glyphs[p:i + 1]).lstrip(".-")
+                if prefix and "".join(run).startswith(text):
+                    found[(prefix, text, kind)] += 1
+                i = k
+                continue
+            i += 1
+        page_text = re.sub(r"\s+", " ", self.page_text(index))
+        result = []
+        for (prefix, run, kind), count in found.items():
+            total = len(re.findall(re.escape(prefix) + r" ?" + re.escape(run), page_text))
+            if total <= count:
+                result.append((prefix, run, kind))
+        return result
+
+    def drop_caps(self, index):
+        """[(letter, following_text)] for oversized initials that start a paragraph."""
+        glyphs = self._glyphs(index)
+        heights = [g[2] for g in glyphs if g[2] > 0 and not g[1] and g[0].strip()]
+        if not heights:
+            return []
+        body_h = statistics.median(heights)
+        out = []
+        for i, (ch, gen, h, *_rest) in enumerate(glyphs):
+            if gen or not ch.isupper() or h < DROP_CAP_RATIO * body_h:
+                continue
+            follow = "".join(g[0] for g in glyphs[i + 1:i + 40])
+            follow = re.split(r"\s", follow, maxsplit=1)[0]
+            nxt = glyphs[i + 1] if i + 1 < len(glyphs) else None
+            if nxt and nxt[2] < h / DROP_CAP_RATIO * 1.2 and follow[:1].islower() and len(follow) >= 2:
+                out.append((ch, follow))
+        return out
 
     # ------------------------------------------------------------------ checks
 
@@ -251,7 +390,7 @@ class PdfAnalyzer:
             filled = fill_mode.value != 0 and alpha > 0 and (red + green + blue) < 735
             if not (filled or stroke.value):
                 continue
-            rect = (l / W, (H - t) / H, r / W, (H - b) / H)
+            rect = self.to_frac(index, l, b, r, t)
             if any(_overlap_fraction(rect, ex) > 0.3 for ex in exclude):
                 continue
             if any(_iou(rect, other) > 0.8 for other in rects):

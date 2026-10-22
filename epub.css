@@ -12,15 +12,18 @@ h2 { font-size: 1.25em; margin: 1.4em 0 0.6em; }
 h3 { font-size: 1.1em; margin: 1.2em 0 0.5em; font-style: italic; }
 h4, h5, h6 { font-size: 1em; margin: 1em 0 0.4em; }
 
-/* Figures */
-figure { margin: 1em 0; text-align: center; page-break-inside: avoid; break-inside: avoid; }
-figure img, img.table-image, .table-image img { max-width: 100%; height: auto; }
+/* Figures: an image never exceeds the screen in either direction (vh where the
+   reader supports it, e.g. Kobo kepub; max-width elsewhere). No break-inside:avoid
+   on the figure: with a long caption it is taller than a page, and readers then
+   clip it instead of splitting it. The image only keeps its caption on the same page. */
+figure { margin: 1em 0; text-align: center; }
+figure img, img.table-image, .table-image img { display: block; margin: 0 auto; width: auto; height: auto;
+  max-width: 100%; max-height: 92vh; page-break-after: avoid; break-after: avoid; }
 figcaption, .table-block > p { font-size: 0.85em; line-height: 1.35; text-align: left;
   text-indent: 0; margin: 0.4em 0 0.8em; }
 
 /* Info boxes, sidebars */
-.box { margin: 1em 0; padding: 0.6em 0.8em; border: 1px solid currentColor;
-  border-radius: 0.3em; page-break-inside: avoid; break-inside: avoid; }
+.box { margin: 1em 0; padding: 0.6em 0.8em; border: 1px solid currentColor; border-radius: 0.3em; }
 .box p { text-indent: 0; margin: 0.3em 0; }
 
 /* Tables: real tables, scroll on readers that allow it, small type for wide ones */

@@ -75,6 +75,10 @@ ENV PATH=/venv/bin:/usr/local/bin:/usr/bin:/bin \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
+# Shown in the UI header and startup log, so a stale container/code mount is obvious.
+ARG APP_REVISION=dev
+ENV APP_REVISION=${APP_REVISION}
+
 WORKDIR /app
 # uid 1000 matches the owner of the bind-mounted ./library and ./model_cache on the host
 USER 1000:1000

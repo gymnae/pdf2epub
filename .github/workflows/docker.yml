@@ -70,6 +70,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: ${{ env.TEST_TAG }}
+          build-args: APP_REVISION=${{ github.sha }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', env.REGISTRY, env.IMAGE_NAME) || '' }}
 
@@ -88,6 +89,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
+          build-args: APP_REVISION=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache

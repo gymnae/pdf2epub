@@ -1,6 +1,7 @@
 services:
   pdf-converter:
-    build: .
+    # Prebuilt by .github/workflows/docker.yml; use `build: .` instead to build locally.
+    image: ghcr.io/gymnae/pdf2epub:latest
     container_name: pdf-to-epub-gpu
     ports:
       - "7860:7860"
@@ -24,9 +25,11 @@ services:
       - HF_HOME=/app/model_cache/huggingface
       - TORCH_HOME=/app/model_cache/torch
 
+    # Data only. Do NOT mount the source tree over /app: it would replace the
+    # application code baked into the image with whatever is checked out on the host.
     volumes:
-      - .:/app
       - ./library:/app/library
+      - ./model_cache:/app/model_cache
     deploy:
       resources:
         reservations:

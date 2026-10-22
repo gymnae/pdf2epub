@@ -28,7 +28,7 @@ os.makedirs(LIBRARY_BASE_DIR, exist_ok=True)
 
 # Bump when the PDF -> Markdown structure step changes, so cached extractions
 # are re-structured (cheap, no GPU) instead of reusing stale Markdown.
-STRUCTURE_VERSION = "3"
+STRUCTURE_VERSION = "4"
 
 GPU_WAIT_TIMEOUT_S = int(os.environ.get("GPU_WAIT_TIMEOUT_S", "900"))
 GPU_POLL_S = int(os.environ.get("GPU_POLL_S", "15"))
@@ -366,7 +366,10 @@ def _summary(stats):
               ("footnotes_anchored_to_paragraph", "unmarked notes"), ("boxes", "info boxes"),
               ("paragraphs_rejoined", "split paragraphs re-joined"), ("styled_runs", "italic/bold runs recovered"),
               ("running_heads_dropped", "running heads removed"), ("cover_sheet_dropped", "cover sheet removed"),
-              ("links_dropped", "misaligned links removed")]
+              ("links_dropped", "misaligned links removed"), ("scripts_recovered", "sub/superscripts recovered"),
+              ("drop_caps_restored", "drop caps restored"), ("page_notes_detected", "page-foot notes detected"),
+              ("decorations_dropped", "logos/badges removed"),
+              ("frame_offset_pages", "pages with shifted crop box corrected")]
     parts = [f"{stats[k]} {label}" for k, label in labels if stats.get(k)]
     return ", ".join(parts)
 
@@ -519,7 +522,8 @@ def build_epub(md_text, metadata_dict, include_toc, math_mode, work_dir, base_na
 
 with gr.Blocks(title="PDF to EPUB Wizard") as interface:
     gr.Markdown("# 🧙‍♂️ PDF to EPUB Wizard")
-    gr.Markdown("*Self-Hosted Edition: Offline SVG Math, Hidden Metadata Transfer & Dual Outputs.*")
+    gr.Markdown("*Self-Hosted Edition: Offline SVG Math, Hidden Metadata Transfer & Dual Outputs.*"
+                f" <small>build {os.environ.get('APP_REVISION', 'dev')[:7]}</small>")
 
     session_state = gr.State()
     basename_state = gr.State()
@@ -592,5 +596,6 @@ with gr.Blocks(title="PDF to EPUB Wizard") as interface:
     md_editor.change(fn=render_preview, inputs=[md_editor, session_state], outputs=[md_preview], trigger_mode="always_last")
 
 if __name__ == "__main__":
+    print(f"PDF to EPUB Wizard, build {os.environ.get('APP_REVISION', 'dev')}", flush=True)
     # max_size=1 prevents request pile-ups, api_open=False disables background APIs
     interface.queue(max_size=1, api_open=False).launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft())

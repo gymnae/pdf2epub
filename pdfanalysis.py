@@ -15,8 +15,10 @@ Rectangles are page fractions with a top-left origin, relative to the visible
 """
 import ctypes
 import io
+import math
 import re
 import statistics
+from array import array
 from collections import Counter
 
 import pypdfium2 as pdfium
@@ -30,6 +32,9 @@ COVER_SHEET_MARKERS = (
     "accepted manuscript", "receive free email alerts", "view the article online",
     "terms of service", "use of this article is subject to", "reprints and permissions",
     "rights and permissions", "article information",
+    # ResearchGate
+    "see discussions, stats, and author profiles", "all content following this page was uploaded by",
+    "requested enhancement of the downloaded file", "view project", "see profile",
 )
 ITALIC_NAME = re.compile(r"(italic|oblique|[-.,_]it$|[-.,_]i$|ital\b|-ita\b|cmti|cmmi)", re.I)
 BOLD_NAME = re.compile(r"(bold|black|heavy|semibd|[-.,_]b$|[-.,_]bd$|cmbx)", re.I)
@@ -41,6 +46,12 @@ SCRIPT_SIZE_RATIO = 0.88    # sub/superscript glyphs are <= ~80% of the base gly
 SCRIPT_SHIFT_RATIO = 0.12   # ... and their baseline moves by >= ~15% of it
 SCRIPT_CHARS = re.compile(r"[0-9A-Za-z,+\-−–*†‡§¶‖'′=().α-ωΔ]")
 DROP_CAP_RATIO = 1.8        # a drop cap is >= ~2 lines tall
+# Ligatures whose glyph a broken ToUnicode map gives as its first letter only.
+LIGATURE_TAILS = {"T": ("h",), "f": ("f", "i", "l", "t", "fi", "fl", "b", "h", "j", "k")}
+LIGATURE_RARE = {"b", "h", "j", "k"}   # only some fonts have fb/fh/fj/fk: need intact spellings
+LIGATURE_WIDE = 1.35        # such a glyph is ~1.7-2x as wide as the letter alone
+LIGATURE_FIT = 0.95         # ... and 3-8% narrower than its letters side by side
+LIGATURE_SLACK = 0.07       # widths closer than this don't decide (fi/fl; italics vary more)
 INK_DELTA = 24              # grey-level difference from the page background that counts as drawn
 CAPTION_START = re.compile(
     r"\s*(fig(ure|ura)?|figs?|tab(le|la|leau|elle)?|plate|chart|map|scheme|exhibit|illustration|"
@@ -66,6 +77,9 @@ class PdfAnalyzer:
         self._glyph_cache = {}
         self._frames = {}
         self._body_font = ""
+        self._scanned = None
+        self._running = None
+        self._ligature_table = None
 
     def close(self):
         try:
@@ -95,6 +109,17 @@ class PdfAnalyzer:
             w, h = page.get_size()
             self._frames[index] = (left, top, w or 1.0, h or 1.0)
         return self._frames[index]
+
+    def visible_frame(self, index):
+        """(dx, dy, w, h, media_w, media_h): the visible area within the MediaBox, in
+        points from the MediaBox's top-left corner. marker gives boxes in MediaBox
+        coordinates, which differ from ours wherever a (possibly inherited) CropBox is set."""
+        page = self.pdf[index]
+        if page.get_rotation():
+            return None
+        left, top, w, h = self._frame(index)
+        ml, mb, mr, mt = page.get_mediabox()
+        return left - ml, mt - top, w, h, mr - ml, mt - mb
 
     def to_frac(self, index, l, b, r, t):
         """PDF user-space box -> page fractions (top-left origin, visible area)."""
@@ -244,6 +269,55 @@ class PdfAnalyzer:
     def has_cover_sheet(self):
         return 0 in self.cover_pages()
 
+    def _scan(self):
+        """Per page, what the document-wide checks need (running heads, ligatures),
+        read in one pass: reading glyphs is the costly part on long books. Columns,
+        not per-glyph tuples, to stay small."""
+        if self._scanned is None:
+            self._scanned = []
+            for i in range(len(self.pdf)):
+                lines = [(r, n, t) for r, n, t in self.text_lines(i)
+                         if n >= 3 and not (0.2 < r[1] and r[3] < 0.85)]
+                chars, gens, fonts = [], bytearray(), []
+                ratios, lefts, rights = array("f"), array("f"), array("f")
+                for ch, gen, h, _x, _y, _r, box, font, _w in self._glyphs(i):
+                    chars.append(ch)
+                    gens.append(gen)
+                    fonts.append(font)
+                    ratios.append((box[2] - box[0]) / h if h > 0 else 0.0)
+                    lefts.append(box[0])
+                    rights.append(box[2])
+                self._scanned.append({"margin_lines": lines, "chars": "".join(chars) if all(
+                    len(c) == 1 for c in chars) else chars, "gens": gens, "fonts": fonts,
+                    "ratios": ratios, "lefts": lefts, "rights": rights})
+        return self._scanned
+
+    def running_heads(self):
+        """{page: [(rect, key)]} of running heads and feet: lines near the top or bottom
+        that recur at the same height on >= 3 pages, compared with digits masked
+        ("4645 L. Skinner", "Facing future climate change 4631"). marker usually
+        labels them, but not always."""
+        if self._running is None:
+            seen = {}
+            for i, page in enumerate(self._scan()):
+                for rect, n, text in page["margin_lines"]:
+                    key = _running_key(text)
+                    if len(key) >= 3:
+                        seen.setdefault(key, []).append((i, rect))
+            self._running = {}
+            for key, hits in seen.items():
+                for i, rect in hits:
+                    pages = {j for j, r in hits if abs(r[1] - rect[1]) < 0.015}
+                    if len(pages) >= 3:
+                        self._running.setdefault(i, []).append((rect, key))
+        return self._running
+
+    def is_running_head(self, index, rect, text):
+        """Whether `text` at `rect` (page fractions) is one of the page's running heads."""
+        key = _running_key(text)
+        return any(key == k and min(rect[3], r[3]) - max(rect[1], r[1]) > 0
+                   for r, k in self.running_heads().get(index, ()))
+
     # ------------------------------------------------------------- font style
 
     @staticmethod
@@ -304,7 +378,7 @@ class PdfAnalyzer:
         return name or f"anon-{ctypes.cast(font, ctypes.c_void_p).value}"
 
     def _text_objects(self, index):
-        """(font_key, text) for each top-level text object of a page."""
+        """(font_key, text, (l, b, r, t)) for each top-level text object of a page."""
         page = self.pdf[index]
         tp = page.get_textpage()
         out = []
@@ -319,15 +393,30 @@ class PdfAnalyzer:
                 lambda: pdfium_c.FPDFTextObj_GetText(obj.raw, tp.raw, None, 0),
                 lambda b, n: pdfium_c.FPDFTextObj_GetText(obj.raw, tp.raw, b, n))
             if text:
-                out.append((key, text))
+                out.append((key, text, obj.get_pos()))
         return out
+
+    def _partial_word(self, index, pos):
+        """Whether a text object at `pos` is part of a word: a letter or digit adjoins
+        it on its line ("at" of "NATURE" set in small caps as separate pieces)."""
+        l, b, r, t = pos
+        h = max(t - b, 1e-6)
+        for ch, gen, gh, x, y, right, box, *_ in self._glyphs(index):
+            if gen or not ch.isalnum() or gh <= 0:
+                continue
+            cy = (box[1] + box[3]) / 2
+            if not b - 0.2 * h <= cy <= t + 0.2 * h:
+                continue
+            if 0 <= l - box[2] < 0.12 * gh or 0 <= box[0] - r < 0.12 * gh:
+                return True
+        return False
 
     def _body_metrics(self):
         if self._body_style is None:
             counts = Counter()
             n = len(self.pdf)
             for i in range(0, n, max(1, n // 6)):
-                for key, text in self._text_objects(i):
+                for key, text, _pos in self._text_objects(i):
                     counts[key] += len(text)
             body = None
             for key, _ in counts.most_common():
@@ -347,10 +436,12 @@ class PdfAnalyzer:
         """
         body_slant, body_ink = self._body_metrics()
         found = {"italic": Counter(), "bold": Counter()}
-        for key, text in self._text_objects(index):
+        for key, text, pos in self._text_objects(index):
             slant, ink = self._font_cache.get(key, (None, None))
             phrase = re.sub(r"\s+", " ", text).strip()
             if len(phrase) < 2 or not re.search(r"\w\w", phrase):
+                continue
+            if len(phrase) <= 4 and self._partial_word(index, pos):
                 continue
             base = key.split("+")[-1]
             # Relative to the body font: some PDFs set all running text in a bold
@@ -429,10 +520,156 @@ class PdfAnalyzer:
         return italic / len(span), bold / len(span)
 
     def page_words(self, index):
-        """Words of the text layer, soft hyphens and their line breaks removed."""
+        """Words of the text layer, soft hyphens and their line breaks removed, lost
+        ligature letters restored."""
         text = "".join(g[0] for g in self._glyphs(index))
         text = re.sub(r"[\ufffe\x02]\s*", "", text)
-        return text.split()
+        repairs = dict(self.ligature_repairs(index))
+        if not repairs:
+            return text.split()
+        out = []
+        for w in text.split():
+            m = re.fullmatch(r"(\W*)(.*?)(\W*)", w)
+            out.append(m.group(1) + repairs.get(m.group(2), m.group(2)) + m.group(3))
+        return out
+
+    # ------------------------------------------------------------- ligatures
+
+    def ligature_repairs(self, index):
+        """[(broken, fixed)] words of a page whose ligature glyphs the text layer maps
+        to their first letter only ("Te"/"The", "efects"/"effects", "food"/"flood"), a
+        common font-embedding fault (e.g. Springer Nature PDFs). Only words whose every
+        occurrence on the page is broken, so replacing them in marker's text is safe."""
+        return self._ligatures().get(index, [])
+
+    def _ligatures(self):
+        if self._ligature_table is not None:
+            return self._ligature_table
+        self._ligature_table = {}
+        pages, ratios = self._scan(), {}
+        for page in pages:
+            for ch, gen, ratio, font in zip(page["chars"], page["gens"], page["ratios"], page["fonts"]):
+                if ratio > 0 and not gen and ch.isalpha():
+                    ratios.setdefault((font, ch), []).append(ratio)
+        med = {k: statistics.median(v) for k, v in ratios.items() if len(v) >= 5}
+        # A letter rare in its font (a capital in italics): estimate it from the other
+        # fonts, scaled by how wide this font sets the letters both have.
+        by_char = {}
+        for (font, ch), v in ratios.items():
+            by_char.setdefault(ch, []).extend(v)
+        overall = {ch: statistics.median(v) for ch, v in by_char.items() if len(v) >= 5}
+        scale = {}
+        for (font, ch), m in med.items():
+            scale.setdefault(font, []).append(m / overall[ch])
+        for font, ch in set(ratios) | {(f, c) for f in scale for c in "fhilt"}:
+            if (font, ch) not in med and font in scale and ch in overall:
+                med[(font, ch)] = overall[ch] * statistics.median(scale[font])
+
+        # Over-wide first letters of a ligature whose other letters are missing,
+        # grouped by font and exact width: one group is one ligature glyph.
+        groups = {}                      # (font, ch, width) -> [(page, glyph index)]
+        for p, page in enumerate(pages):
+            chars, lefts, rights = page["chars"], page["lefts"], page["rights"]
+            for i, (ch, gen, ratio, font) in enumerate(zip(chars, page["gens"], page["ratios"], page["fonts"])):
+                if ch not in LIGATURE_TAILS or gen:
+                    continue
+                normal = med.get((font, ch))
+                if not normal or ratio < LIGATURE_WIDE * normal:
+                    continue
+                nxt = next((k for k in range(i + 1, min(i + 3, len(chars))) if chars[k].strip()), None)
+                if nxt is not None and lefts[nxt] < rights[i] - 0.3 * (rights[i] - lefts[i]):
+                    continue             # the next letter overlaps: mapped correctly
+                groups.setdefault((font, ch, round(ratio, 3)), []).append((p, i))
+        if not groups:
+            return self._ligature_table
+
+        # Words as glyph-index runs; a soft hyphen joins across its line break.
+        tokens, token_of = [], []
+        for page in pages:
+            toks, cur, joining = [], [], False
+            for i, ch in enumerate(page["chars"]):
+                if ch in "\ufffe\x02":
+                    joining = True
+                elif not ch.strip():
+                    if cur and not joining:
+                        toks.append(cur)
+                        cur = []
+                else:
+                    cur.append(i)
+                    joining = False
+            if cur:
+                toks.append(cur)
+            tokens.append(toks)
+            token_of.append({i: t for t, idx in enumerate(toks) for i in idx})
+
+        def spell(p, tok, extra=None):
+            text = "".join(pages[p]["chars"][i] + (extra or {}).get(i, "") for i in tok)
+            return re.sub(r"^\W+|\W+$", "", text)
+
+        flagged = {(p, i) for hits in groups.values() for p, i in hits}
+        vocab = Counter()
+        for p, toks in enumerate(tokens):
+            vocab.update(spell(p, t).lower() for t in toks if not any((p, i) in flagged for i in t))
+
+        # Letter trigrams of the intact words: which spelling looks like this document's
+        # language where the width cannot tell (fi/fl and ffi/ffl are equally wide).
+        trigrams = Counter()
+
+        def learn(word, n=1):
+            w = f"^{word.lower()}$"
+            for k in range(len(w) - 2):
+                trigrams[w[k:k + 3]] += n
+
+        for w, n in vocab.items():
+            learn(w, n)
+
+        def plausible(word):
+            w, total = f"^{word.lower()}$", sum(trigrams.values()) or 1
+            return sum(math.log((trigrams[w[k:k + 3]] + 0.5) / total) for k in range(len(w) - 2))
+
+        def fit(key, tail):
+            font, ch, ratio = key
+            return abs(LIGATURE_FIT * (med[(font, ch)] + sum(med[(font, c)] for c in tail)) - ratio)
+
+        # Which letters each glyph stands for: the spelling the document has intact elsewhere.
+        scored = []
+        for key, hits in groups.items():
+            font, ch, ratio = key
+            fits = [t for t in LIGATURE_TAILS[ch]
+                    if all((font, c) in med for c in t) and fit(key, t) <= 0.15 * ratio]
+            spelt = {t: [spell(p, tokens[p][token_of[p][i]], {i: t}) for p, i in hits] for t in fits}
+            votes = {t: sum(1 for w in spelt[t] if vocab[w.lower()]) for t in fits}
+            scored.append((max(votes.values(), default=0), len(hits), key, fits, votes, spelt))
+        # Best-attested glyphs first; their repaired words then inform the rest.
+        scored.sort(key=lambda s: (-s[0], -s[1]))
+        used, choice, confirmed = set(), {}, set()
+        for _, _, key, fits, votes, spelt in scored:
+            font, ch, ratio = key
+            free = [t for t in fits if (font, ch, t) not in used and (votes[t] or t not in LIGATURE_RARE)]
+            if not free:
+                continue
+            closest = min(fit(key, t) for t in free)
+            best = max(free, key=lambda t: (votes[t], fit(key, t) <= closest + LIGATURE_SLACK * ratio,
+                                            sum(plausible(w) for w in spelt[t])))
+            if votes[best] > 0:
+                confirmed.add(font)
+            elif font not in confirmed:
+                continue                 # no evidence that this font's ligatures are broken
+            used.add((font, ch, best))   # each tail is one glyph per font
+            choice[key] = best
+            for w in spelt[best]:
+                learn(w)
+
+        # Per page, the words to replace: only where every occurrence is broken.
+        for p, toks in enumerate(tokens):
+            extra = {i: choice[k] for k, hits in groups.items() if k in choice for q, i in hits if q == p}
+            if not extra:
+                continue
+            raw = Counter(spell(p, t) for t in toks)
+            pairs = Counter((spell(p, t), spell(p, t, extra)) for t in toks if any(i in extra for i in t))
+            self._ligature_table[p] = [(old, new) for (old, new), n in pairs.items()
+                                       if old and old != new and raw[old] == n]
+        return self._ligature_table
 
     def glyph_height(self, index):
         """Median glyph height on a page in PDF points: the body text's size there."""
@@ -751,6 +988,11 @@ def _font_base(name):
 
 def _norm(text):
     return re.sub(r"\s+", "", text).lower()
+
+
+def _running_key(text):
+    """Running heads compare without page numbers, spacing and punctuation."""
+    return re.sub(r"\d+", "#", re.sub(r"[\W_]+", "", text.lower()))
 
 
 def _union(a, b):

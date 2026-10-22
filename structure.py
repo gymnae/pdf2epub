@@ -119,6 +119,59 @@ def _close_scripts(html):
     return "".join(parts)
 
 
+_INTERNAL_LINK = re.compile(r"<a\b[^>]*\bhref=[\"']#[^>]*>(.*?)</a>", re.S | re.I)
+_TEX_TEXT = re.compile(r"(<[^>]+>)|\$(?=\S)([^$<>]{1,200}?[\\^_{}][^$<>]{0,200}?)(?<=\S)\$")
+_CITATION = r"(?:<sup>[\d,;\-–\s*†‡§]+</sup>|<math display=\"inline\">\s*\^\s*\{?[\d,;\-–\s]+\}?\s*</math>)"
+_LINK = re.compile(r"<a\b[^>]*\bhref=\"([^\"]+)\"[^>]*>([^<]*)</a>", re.I)
+
+
+def _url_key(s):
+    s = re.sub(r"[^\w.:/~%?=&#+\-]", "", htmllib.unescape(s).lower())    # "(www.x.net)" -> "www.x.net"
+    return re.sub(r"^(https?://|doi:)", "", s)
+
+
+def _mend_links(html):
+    """An address broken at a line end comes as two links ("https://grace.jpl.nasa." +
+    "gov/") or as a link and plain text, as marker's link spans drift: one link."""
+    out, pos = [], 0
+    for m in _LINK.finditer(html):
+        if m.start() < pos:
+            continue
+        href, text = m.group(1), m.group(2)
+        end = m.end()
+        while True:
+            # the next link to the same address, or plain text that continues it
+            nxt = _LINK.match(html, end + len(re.match(r"\s*", html[end:]).group(0)))
+            joined = nxt and _url_key(text + nxt.group(2)).rstrip(".,;)")
+            if nxt and nxt.group(1) == href and len(_url_key(text)) >= 4 and joined in _url_key(href):
+                text, end = text.strip() + nxt.group(2), nxt.end()
+                continue
+            tail = re.match(r"\s*([^\s<]{2,})", html[end:])
+            if (tail and len(_url_key(text)) >= 4
+                    and _url_key(href).startswith(_url_key(text + tail.group(1)).rstrip(".,;)"))):
+                text, end = text.strip() + tail.group(1), end + tail.end()
+                continue
+            break
+        space = " " if text != text.rstrip() else ""        # "gov/ (JPL)": keep the gap
+        out.append(html[pos:m.start()] + html[m.start():m.start(2)] + text.rstrip() + "</a>" + space)
+        pos = end
+    return "".join(out) + html[pos:]
+
+
+def _normalize_markup(html):
+    # Internal links (marker's citation and cross-reference anchors) are never shown,
+    # and their spans drift: "validat<a href="#page-11-3">e70</a>" would split words.
+    html = _INTERNAL_LINK.sub(r"\1", html)
+    # TeX left as text ("studies $^{36,37,41-44}$"): math, like marker's other formulas.
+    # Only with TeX syntax inside, so prices ("$5 and $10") stay text.
+    html = _TEX_TEXT.sub(lambda m: m.group(1) or f'<math display="inline">{m.group(2)}</math>', html)
+    # Citations sit flush against the word they cite ("years ^106,107^" read with a
+    # space); labels ("USA. ²Jet Propulsion", "USA. ³ Department") keep theirs.
+    html = re.sub(r"(?<=[\w,;:)\]])\s+(" + _CITATION + r")(?=[\s.,;:)<]|$)", r"\1", html)
+    html = re.sub(r"(" + _CITATION + r")\s+(?=[.,;:](?:\s|$|<))", r"\1", html)
+    return _mend_links(html) if "<a" in html else html
+
+
 def restore_tags(html):
     """marker sometimes HTML-escapes the formatting tags of OCR'd lines, once or
     twice, so "CO<sub>2</sub>" arrives as the literal text "CO&lt;sub&gt;2&lt;/sub&gt;"
@@ -129,7 +182,7 @@ def restore_tags(html):
     html, n = _ESCAPED_TAG.subn(lambda m: f"<{m.group(1)}{m.group(2).lower()}>", html)
     # "<sup>&lt;sup&gt;1</sup>" -> "<sup><sup>1</sup>": one tag opened twice, closed once
     html = re.sub(r"<(sup|sub|i|b|em|strong|u)>(\s*<\1>)+", r"<\1>", html)
-    return _close_scripts(html) if n else html
+    return _normalize_markup(_close_scripts(html) if n else html)
 
 
 def parse_html(s):
@@ -753,9 +806,14 @@ class Item:
         return html_plain(self.html)
 
 
-def _norm_bbox(bbox, page_bbox):
+def _norm_bbox(bbox, page_bbox, frame=None):
+    """Page fractions of marker's box. With `frame` (dx, dy, w, h: the PDF's visible
+    area within marker's page box) relative to that area, as the analyzer works."""
     px0, py0, px1, py1 = page_bbox
     w, h = (px1 - px0) or 1.0, (py1 - py0) or 1.0
+    if frame:
+        px0, py0 = px0 + frame[0], py0 + frame[1]
+        w, h = frame[2] or 1.0, frame[3] or 1.0
     x0, y0, x1, y1 = bbox
     return ((x0 - px0) / w, (y0 - py0) / h, (x1 - px0) / w, (y1 - py0) / h)
 
@@ -842,6 +900,48 @@ def _heading_level(html):
     return int(m.group(1)) if m else 2
 
 
+_REF_LABEL = re.compile(r"\s*\[?(\d{1,4})[.\])]\s")
+
+
+def _match_key(text):
+    """Letters and digits only, lower case, accents and ligatures folded: marker's text
+    and the PDF's lines then compare equal despite quote, dash and spacing styles."""
+    text = unicodedata.normalize("NFKD", fix_text(text))
+    return "".join(c for c in text.lower() if c.isalnum() and not unicodedata.combining(c))
+
+
+def _text_offsets(html):
+    """(key, offsets): _match_key of the text of `html` and, per key character, its
+    index in `html`. For finding a text position in markup."""
+    chars, offsets = [], []
+    for m in re.finditer(r"<[^>]*>|&#?\w+;|.", html, re.S):
+        tok = m.group(0)
+        if tok.startswith("<"):
+            continue
+        for c in _match_key(htmllib.unescape(tok)):
+            chars.append(c)
+            offsets.append(m.start())
+    return "".join(chars), offsets
+
+
+def _split_block(html, cut):
+    """`<li ...>a b</li>` (or <p>) split at index `cut`, between a and b, into two."""
+    head = re.match(r"\s*<(li|p)\b[^>]*>", html)
+    if not head:
+        return html[:cut].rstrip(), html[cut:]
+    return html[:cut].rstrip() + f"</{head.group(1)}>", head.group(0).strip() + html[cut:]
+
+
+def _join_blocks(a, b):
+    """`<li>a</li>` + `<li>b</li>` -> `<li>a b</li>`; a hyphen at a's end joins the word."""
+    a = re.sub(r"\s*</(li|p)>\s*$", "", a)
+    b = re.sub(r"^\s*<(li|p)\b[^>]*>", "", b)
+    a = a.rstrip()
+    if a.endswith("-") and len(a) > 1 and a[-2].isalpha() and re.match(r"\s*[a-z]", html_plain(b)):
+        return a[:-1] + b.lstrip()
+    return a + ("" if a.endswith(("/", "-")) else " ") + b.lstrip()   # URLs, DOIs
+
+
 class Converter:
     def __init__(self, doc, analyzer=None, out_dir=".", image_subdir="images", drop_cover=True):
         self.doc = doc
@@ -855,6 +955,7 @@ class Converter:
         self._fig_count = 0
         self._page_texts = {}    # page -> [(kind, bbox, text)] of text blocks, for figure crops
         self._page_floats = {}   # page -> [bbox] of figures and tables
+        self._page_frame = None  # page being collected: its visible area in marker's coordinates
 
     # ---- collection
 
@@ -866,6 +967,15 @@ class Converter:
             pnum = int(m.group(1)) if m else pidx
             self.page_count = max(self.page_count, pnum + 1)
             pb = page.get("bbox") or [0, 0, 1, 1]
+            self._page_frame = None
+            if self.an is not None:
+                try:
+                    dx, dy, w, h, mw, mh = self.an.visible_frame(pnum)
+                    pw, ph = pb[2] - pb[0], pb[3] - pb[1]
+                    if abs(mw - pw) < 1 and abs(mh - ph) < 1 and abs(dx) + abs(dy) + abs(w - pw) + abs(h - ph) > 1:
+                        self._page_frame = (dx, dy, w, h)     # marker's page is the MediaBox, cropped
+                except Exception:
+                    pass
             for blk in page.get("children") or []:
                 items.extend(self._from_block(blk, pnum, pb))
         return items
@@ -873,7 +983,7 @@ class Converter:
     def _from_block(self, blk, pnum, pb):
         bt = blk.get("block_type", "")
         html = restore_tags(blk.get("html") or "")
-        bbox = _norm_bbox(blk.get("bbox") or pb, pb)
+        bbox = _norm_bbox(blk.get("bbox") or pb, pb, self._page_frame)
         kids = blk.get("children") or []
         if bt in DROP_TYPES:
             return []
@@ -1008,6 +1118,39 @@ class Converter:
                             it.html, done = _replace_nth_word(it.html, old, new, nth)
                         if done:
                             self._count("text_layer_corrections")
+
+    def _ligature_fix(self, items):
+        """Ligatures the PDF's text layer maps to their first letter only ("Te", "efects",
+        "food" for "The", "effects", "flood"): marker reads that text, so its words carry
+        the same gaps. The analyzer works out the missing letters from glyph widths."""
+        if self.an is None:
+            return
+        for page in sorted({it.page for it in items}):
+            try:
+                repairs = self.an.ligature_repairs(page)
+            except Exception:
+                continue
+            if not repairs:
+                continue
+            pattern = re.compile(r"(?<![\w&])(" + "|".join(re.escape(htmllib.escape(old, quote=False))
+                                                          for old, _ in repairs) + r")(?!\w)")
+            table = {htmllib.escape(old, quote=False): htmllib.escape(new, quote=False) for old, new in repairs}
+
+            def fix(html):
+                parts = re.split(r"(<math\b.*?</math>|<[^>]+>)", html, flags=re.S)
+                for k in range(0, len(parts), 2):
+                    parts[k], n = pattern.subn(lambda m: table[m.group(1)], parts[k])
+                    if n:
+                        self._count("ligatures_restored", n)
+                return "".join(parts)
+
+            for it in items:
+                if it.page != page:
+                    continue
+                it.html = fix(it.html)
+                it.children = [fix(c) if isinstance(c, str) else c for c in it.children]
+                if it.caption is not None:
+                    it.caption.html = fix(it.caption.html)
 
     def _table_text_fix(self, items):
         """Table cells against the text layer: marker drops range dots ("40 2" for
@@ -1374,6 +1517,21 @@ class Converter:
         repeated_margin = {k for k, pages in pages_of.items() if len(pages) >= 3}
         # ...and then its other occurrences too (e.g. a journal logo's text on the title page).
         margin_keys = {key(it) for it in items if it.kind in ("para", "heading") and self._in_margin(it)}
+        # Page margins vary (cropped scans, journals with wide heads): a bare number above
+        # or below all other text of its page is a page number wherever it sits.
+        extent = {}
+        for it in items:
+            if it.kind in ("para", "heading", "list", "footnote") and not re.fullmatch(r"\d{1,4}", it.text):
+                top, bottom = extent.get(it.page, (1, 0))
+                extent[it.page] = (min(top, it.bbox[1]), max(bottom, it.bbox[3]))
+        outside = lambda it: it.page in extent and (it.bbox[3] <= extent[it.page][0] + 0.005
+                                                    or it.bbox[1] >= extent[it.page][1] - 0.005)
+        def running_head(it):
+            try:
+                return self.an is not None and self.an.is_running_head(it.page, it.bbox, it.text)
+            except Exception:
+                return False
+
         out = []
         for it in items:
             if it.kind in ("para", "heading"):
@@ -1383,9 +1541,11 @@ class Converter:
                                    key(it) in margin_keys and len(text) <= 60)))
                                or (key(it) in repeated and len(pages_of[key(it)]) >= 0.5 * self.page_count
                                    and not sentence))
-                page_number = self._in_margin(it) and re.fullmatch(r"(page\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?", text, re.I)
+                page_number = (self._in_margin(it) or outside(it)) and re.fullmatch(r"(page\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?", text, re.I)
                 junk = re.fullmatch(r"[\d():,;.\-]{8,}", text) is not None  # e.g. Nature's "1234567890():,;"
-                if boilerplate or page_number or junk:
+                # Headings stay: "Chapter 3" atop each chapter opener recurs like a running head.
+                stray_head = it.kind == "para" and len(text) <= 250 and running_head(it)
+                if boilerplate or page_number or junk or stray_head:
                     self.stats["running_heads_dropped"] = self.stats.get("running_heads_dropped", 0) + 1
                     continue
             out.append(it)
@@ -1636,10 +1796,21 @@ class Converter:
                 return "Alpha"
             return None
 
+        top = min(h.level for h in heads)
+        # A label in smaller type above the title ("ARTICLE", "REVIEW ARTICLE",
+        # "Research Paper") is not a heading: the title is the one heading in the
+        # largest type that opens the first page, before the body text.
+        body = next((i for i, it in enumerate(items) if it.kind == "para" and len(it.text) > 200), len(items))
+        opening = [h for h in heads if h.page == heads[0].page and items.index(h) < body]
+        tops = [h for h in opening if h.level == top]
+        if heads[0].level != top and len(tops) == 1 and kind_of(tops[0].text) is None:
+            for h in opening[:opening.index(tops[0])]:
+                h.kind = "para"
+                self._count("heading_labels_demoted")
+            heads = [h for h in heads if h.kind == "heading"]
         kinds = [kind_of(h.text) for h in heads]
         first = heads[0]
         title_idx = None
-        top = min(h.level for h in heads)
         # A numbered chapter title ("1.2 The physicochemical properties of water")
         # is still the title when it is the only heading in the largest type and
         # opens the first page, before any body text.
@@ -1872,6 +2043,138 @@ class Converter:
             defs.append(f"[^{note_id}]: " + inline_md(body, self._ctx(it.page)))
         return md + "\n\n" + "\n\n".join(defs)
 
+    # ---- reference lists
+
+    def _reference_entries(self, items):
+        """One block per reference. At page and column breaks marker merges two
+        entries into one item ("... Paul Limited. Rignot, E. & ...") or starts a new
+        list with the tail of an entry. Numbered lists are split and joined at their
+        labels; unnumbered ones at the PDF lines that start an entry, i.e. at the
+        list's hanging (or first-line) indent."""
+        out, section = [], None
+        for it in items + [None]:
+            if it is None or it.kind == "heading" or (section is not None and it.kind not in ("list", "para")):
+                if section:
+                    out.extend(self._reference_section(section))
+                section = None
+                if it is not None:
+                    out.append(it)
+                    if it.kind == "heading" and REFERENCE_HEADINGS.match(it.text):
+                        section = []
+                continue
+            (section if section is not None else out).append(it)
+        return out
+
+    def _reference_section(self, sec):
+        entries = [[it, h] for it in sec for h in (it.children if it.kind == "list" else [it.html])]
+        if len(entries) < 3:
+            return sec
+        labels = [_REF_LABEL.match(html_plain(h)) for _, h in entries]
+        if sum(1 for m in labels if m) >= 0.8 * len(entries):
+            entries = self._split_numbered(entries)
+        else:
+            entries = self._split_by_indent(entries)
+        if entries is None:
+            return sec
+        out = []
+        for it in sec:
+            mine = [h for owner, h in entries if owner is it]
+            if not mine:
+                continue
+            if it.kind == "list":
+                it.children = mine
+                it.html = " ".join(mine)
+                out.append(it)
+            else:
+                it.html = mine[0]
+                out.append(it)
+                out.extend(Item("para", it.page, it.bbox, h, it.btype) for h in mine[1:])
+        return out
+
+    def _split_numbered(self, entries):
+        out = []
+        labels = [_REF_LABEL.match(html_plain(h)) for _, h in entries]
+        for idx, (owner, h) in enumerate(entries):
+            m = labels[idx]
+            before = labels[idx - 1] if idx else None
+            after = labels[idx + 1] if idx + 1 < len(entries) else None
+            if not m and out and before and after and int(after.group(1)) == int(before.group(1)) + 1:
+                # 95. | <unnumbered> | 96.: the tail of 95 after a column break
+                out[-1][1] = _join_blocks(out[-1][1], h)
+                self._count("references_rejoined")
+                continue
+            expect = int(m.group(1)) + 1 if m else None
+            while expect is not None:
+                cut = None
+                for x in re.finditer(r"[.)\]]((?:\s|</[^>]+>)+)(?:<[^/][^>]*>\s*)*\[?(\d{1,4})[.\])]\s", h):
+                    if int(x.group(2)) == expect:
+                        cut = x.end(1)         # after the period and any tags it closes
+                        break
+                if cut is None:
+                    break
+                first, h = _split_block(h, cut)
+                out.append([owner, first])
+                self._count("references_split")
+                expect += 1
+            out.append([owner, h])
+        return out
+
+    def _split_by_indent(self, entries):
+        if self.an is None:
+            return None
+        # PDF lines of each list/paragraph, with their indent class within their column.
+        lines_of = {}
+        for owner in {id(o): o for o, _ in entries}.values():
+            try:
+                page_lines = self.an.text_lines(owner.page)
+            except Exception:
+                return None
+            box = (owner.bbox[0] - 0.01, owner.bbox[1] - 0.005, owner.bbox[2] + 0.01, owner.bbox[3] + 0.005)
+            ls = [(r, _match_key(t)) for r, n, t in page_lines if n >= 3 and _contained(r, box) >= 0.8]
+            classed = []
+            for r, key in ls:
+                col = [r2 for r2, _ in ls
+                       if min(r[2], r2[2]) - max(r[0], r2[0]) > 0.5 * min(r[2] - r[0], r2[2] - r2[0])]
+                indent = r[0] - min(r2[0] for r2 in col)
+                cls = "out" if indent < 0.006 else "in" if indent < 0.08 else None
+                if cls and len(key) >= 12:
+                    classed.append((cls, key[:25]))
+            lines_of[id(owner)] = classed
+
+        def first_line_class(owner, h):
+            key = _match_key(html_plain(h))
+            hits = [c for c, k in lines_of[id(owner)] if key.startswith(k)]
+            return hits[0] if len(hits) == 1 else None
+
+        votes = Counter(first_line_class(o, h) for o, h in entries)
+        votes.pop(None, None)
+        if not votes:
+            return None
+        start, n = votes.most_common(1)[0]
+        if n < 3 or n < 0.75 * sum(votes.values()):
+            return None
+        if not any(c != start for ls in lines_of.values() for c, _ in ls):
+            return None                    # no indent to tell entries apart
+        heads = {_match_key(html_plain(h)) for _, h in entries}
+        out = []
+        for owner, h in entries:
+            if out and first_line_class(owner, h) not in (start, None):
+                out[-1][1] = _join_blocks(out[-1][1], h)
+                self._count("references_rejoined")
+                continue
+            # Entry-start lines that no entry starts with: two entries merged there.
+            starts = [k for c, k in lines_of[id(owner)] if c == start and not any(x.startswith(k) for x in heads)]
+            while True:
+                key, offsets = _text_offsets(h)
+                cuts = [key.find(k) for k in starts if key.count(k) == 1 and key.find(k) > 0]
+                if not cuts:
+                    break
+                first, h = _split_block(h, offsets[min(cuts)])
+                out.append([owner, first])
+                self._count("references_split")
+            out.append([owner, h])
+        return out
+
     # ---- paragraph continuation
 
     @staticmethod
@@ -1893,6 +2196,12 @@ class Converter:
             return False
         if head[0].islower() or head[0] in ",;)]":
             return True
+        # "... abrupt changes in climate" | "(Alley et al. 2003). The changes ...": a
+        # parenthesis after a sentence cut off mid-way, unless it enumerates ("(a) ...").
+        if (head[0] == "(" and not re.match(r"\((?:[a-z]|[ivx]+|\d{1,2})\s?\)", head, re.I)
+                and not re.fullmatch(r"\(.*\)", head.strip(), re.S)          # an aside of its own
+                and re.search(r"[a-zà-ÿ]$", NOTE_TOKEN.sub("", prev_md).rstrip(" *_"))):
+            return True
         # "... published by the | Royal Society": only when the paragraph really ends
         # on a function word, and only for real paragraphs (not title/byline lines).
         tail = NOTE_TOKEN.sub("", prev_md).rstrip(" *_")
@@ -1904,6 +2213,7 @@ class Converter:
         floats (figures, tables, boxes); the floats end up after the joined paragraph."""
         out = []
         open_idx = None
+        open_page = None          # page of the open paragraph's last piece
         for blk in blocks:
             it, md = blk
             if (it.kind == "para" and open_idx is not None and len(md) < 300
@@ -1915,7 +2225,7 @@ class Converter:
             if it.kind == "para" and open_idx is not None:
                 prev_it, prev_md = out[open_idx]
                 drop_cap = re.fullmatch(r"\**[A-ZÀ-Þ]\**", prev_md) and md[:1].islower()
-                if (drop_cap or self._starts_continuation(md, prev_md)) and it.page - prev_it.page <= 1:
+                if (drop_cap or self._starts_continuation(md, prev_md)) and it.page - open_page <= 1:
                     if drop_cap:
                         joined = prev_md.strip("*") + md
                     elif prev_md.endswith("-") and md[:1].islower():
@@ -1924,6 +2234,7 @@ class Converter:
                         joined = prev_md + " " + md
                     prev_it.notes.extend(it.notes)
                     out[open_idx] = [prev_it, joined]
+                    open_page = it.page
                     self.stats["paragraphs_rejoined"] = self.stats.get("paragraphs_rejoined", 0) + 1
                     if not self._ends_open(joined):
                         open_idx = None
@@ -1931,6 +2242,7 @@ class Converter:
             out.append(blk)
             if it.kind == "para":
                 open_idx = len(out) - 1 if self._ends_open(md) else None
+                open_page = it.page
             elif it.kind not in ("figure", "table", "box", "caption", "footnote"):
                 open_idx = None
         return out
@@ -1949,6 +2261,7 @@ class Converter:
 
     def _convert(self, items):
         items = self._drop_noise(items)
+        self._ligature_fix(items)
         self._text_layer_fix(items)
         self._table_text_fix(items)
         self._math_fix(items)
@@ -1968,6 +2281,7 @@ class Converter:
         title_pos = next((i for i, it in enumerate(items) if it.kind == "heading" and it.level == 1), None)
         if title_pos:
             items = [items[title_pos]] + items[:title_pos] + items[title_pos + 1:]
+        items = self._reference_entries(items)
 
         blocks = []
         for it in items:

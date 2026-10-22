@@ -28,7 +28,7 @@ os.makedirs(LIBRARY_BASE_DIR, exist_ok=True)
 
 # Bump when the PDF -> Markdown structure step changes, so cached extractions
 # are re-structured (cheap, no GPU) instead of reusing stale Markdown.
-STRUCTURE_VERSION = "8"
+STRUCTURE_VERSION = "9"
 
 GPU_WAIT_TIMEOUT_S = int(os.environ.get("GPU_WAIT_TIMEOUT_S", "900"))
 GPU_POLL_S = int(os.environ.get("GPU_POLL_S", "15"))
@@ -385,12 +385,22 @@ def _alnum(text):
     return re.sub(r"[\W_]+", "", text).lower()
 
 
+_NOT_A_TITLE = re.compile(
+    r"^\s*(doi:|https?://|10\.\d{4,}/|microsoft (word|powerpoint) - |untitled\b)"
+    r"|\.(pdf|docx?|indd|qxd|tex|dvi|ps|rtf|odt)\s*$", re.I)
+
+
 def _drop_stray_metadata(meta, md_text):
-    """PDF Title/Subject fields often hold a layout job name ("beddig") or a file
-    name instead of the real title: keep them only if they occur in the text."""
+    """PDF Title/Subject fields often hold a layout job name ("beddig"), a file name
+    or a DOI instead of the real title: keep them only if they read like a title and
+    occur in the text."""
     body = _alnum(md_text)
     for key in list(meta):
-        if key.lower() in ("title", "subject") and _alnum(str(meta[key]))[:40] not in body:
+        if key.lower() not in ("title", "subject"):
+            continue
+        value = str(meta[key])
+        words = re.findall(r"[^\W\d_]{2,}", value)
+        if _NOT_A_TITLE.search(value) or len(words) < 2 or _alnum(value)[:40] not in body:
             del meta[key]
 
 
@@ -428,13 +438,15 @@ def extract_markdown(pdf_file, force_ocr):
             except Exception:
                 pass
 
-            cover_path = os.path.join(session_dir, "cover.jpg")
-            if not os.path.exists(cover_path):
-                pdf[0].render(scale=2.0).to_pil().convert("RGB").save(cover_path, format="JPEG")
-            pdf.close()
             analyzer = PdfAnalyzer(archive_pdf_path)
             born_digital = analyzer.is_born_digital()
+            # The article's first page, not a publisher/repository cover sheet.
+            first = next((i for i in range(len(pdf)) if i not in analyzer.cover_pages()), 0)
             analyzer.close()
+            cover_path = os.path.join(session_dir, "cover.jpg")
+            if not os.path.exists(cover_path):
+                pdf[first].render(scale=2.0).to_pil().convert("RGB").save(cover_path, format="JPEG")
+            pdf.close()
         except Exception:
             pass
 

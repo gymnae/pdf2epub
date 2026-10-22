@@ -31,6 +31,8 @@ from html.parser import HTMLParser
 from urllib.parse import quote
 
 TABLE_IMAGE_MIN_COLS = int(os.environ.get("TABLE_IMAGE_MIN_COLS", "7"))
+# From this many columns a table is set in smaller type to fit a phone-sized screen.
+TABLE_WIDE_COLS = int(os.environ.get("TABLE_WIDE_COLS", "5"))
 FIGURE_DPI = int(os.environ.get("FIGURE_DPI", "220"))
 FIGURE_MAX_PX = int(os.environ.get("FIGURE_MAX_PX", "1600"))
 # Uncaptioned pictures smaller than this (fraction of the page) are publisher
@@ -46,6 +48,10 @@ REFERENCE_HEADINGS = re.compile(
     r"^\W*(references|bibliography|literature( cited)?|works cited|sources|literatur(verzeichnis)?|"
     r"quellen(verzeichnis)?|références|bibliografía)\W*$", re.I)
 FOOTNOTE_SYMBOLS = "*†‡§¶‖"
+BULLETS = {"•", "●", "▪", "◦", "‣", "∙", "·"}
+ELLIPSES = {"...", "…", "–", "-"}
+CAPTION_LABEL = re.compile(r"^\W*(fig(ure)?|tab(le)?|abb(ildung)?|tabelle|plate|chart|scheme)\.?\s*[\dIVXS]", re.I)
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 AFFILIATION = re.compile(r"\b(universit|institut|department|laborator|centre|center|school of|faculty|"
                          r"college|corresponding author|e-?mail|present address)", re.I)
 CONTINUATION_WORDS = {
@@ -254,7 +260,11 @@ def simple_math(tex):
     \\delta^{18}O_{atm}, 25^{\\circ}C, km^2) -> [(kind, text)], kind '', 'sup' or 'sub'.
     None for anything that needs real math layout. Rendering these as text keeps
     them in the reader's font and size instead of a fixed-size SVG."""
-    if not tex or len(tex) > 60 or not re.search(r"[\^_]", tex):
+    if not tex or not re.search(r"[\^_]", tex):
+        return None
+    # "K_H = \text{HENRY-constant in mol/(m}^3 \times \text{Pa)}": a line of text, not math
+    wordy = len(re.findall(r"[A-Za-z]{3,}", " ".join(_SIMPLE_TEXT_CMD.findall(tex)))) >= 2
+    if len(tex) > (160 if wordy else 60):
         return None
     s = _SIMPLE_TEXT_CMD.sub(lambda m: m.group(1).replace(" ", "\x01"), tex)
     unknown = False
@@ -307,6 +317,133 @@ def math_md(tex, display):
         return "".join(out)
     tex = tex.replace("$", r"\$")
     return f"$${tex}$$" if display else f"${tex}$"
+
+
+# TeX as the PDF text layer spells it, to check marker's formula OCR against it.
+_TEX_TRANSPARENT = {"text", "mathrm", "textrm", "mathit", "textit", "mathbf", "textbf", "mbox", "rm",
+                    "operatorname", "mathsf", "boldsymbol", "overline", "underline", "bar", "hat", "vec",
+                    "tilde", "dot", "left", "right", "big", "Big", "displaystyle", "limits"}
+_TEX_WORDS = {"log", "ln", "exp", "lg", "sin", "cos", "tan", "lim", "max", "min", "det"}
+_TEX_SYMBOLS = {**_SIMPLE_SYMBOLS, "subseteq": "⊆", "supseteq": "⊇", "subset": "⊂", "rightleftharpoons": "⇌",
+                "leftrightarrow": "↔", "rightleftarrows": "⇄", "Rightarrow": "⇒", "Leftrightarrow": "⇔",
+                "bullet": "•", "ldots": "...", "dots": "...", "cdots": "...", "sqrt": "√", "partial": "∂",
+                "nabla": "∇", "sum": "∑", "int": "∫", "prod": "∏", "propto": "∝", "equiv": "≡",
+                "ll": "≪", "gg": "≫", "in": "∈", "ast": "*", "star": "*", "mid": "|", "vert": "|",
+                "langle": "⟨", "rangle": "⟩", "quad": " ", "qquad": " ", "frac": "", "{": "{", "}": "}"}
+# Text-layer symbol -> TeX command, for symbols the formula OCR misread ("•" for "°").
+_SYMBOL_TEX = {"°": "circ", "±": "pm", "×": "times", "·": "cdot", "≈": "approx", "≤": "leq", "≥": "geq",
+               "≠": "neq", "→": "rightarrow", "←": "leftarrow", "∞": "infty", "‰": "permil", "μ": "mu",
+               "Δ": "Delta", "∆": "Delta", "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta", "λ": "lambda",
+               "σ": "sigma", "θ": "theta", "ρ": "rho", "η": "eta", "χ": "chi", "κ": "kappa", "ε": "epsilon"}
+_MFOLD = {"∆": "Δ", "–": "-", "—": "-", "−": "-", "‐": "-", "µ": "μ", "’": "'", "′": "'", "∙": "·", "⋅": "·"}
+
+
+def _mfold(ch):
+    if _SYMBOL_JUNK.match(ch):
+        return ch                                  # NFKC would make "¼" a "1"
+    ch = _MFOLD.get(ch, ch)
+    return (unicodedata.normalize("NFKC", ch) or ch)[0]
+
+
+def _tex_chars(tex):
+    """TeX -> [(char, position in tex or None)]: what the formula looks like as
+    plain text (scripts flattened, commands as symbols, spacing dropped). Literal
+    characters carry their position, a one-symbol command its (start, end) span:
+    those can be edited in place."""
+    out, i, n = [], 0, len(tex)
+    while i < n:
+        c = tex[i]
+        if c == "\\":
+            m = re.match(r"\\([A-Za-z]+)\s*|\\(.)", tex[i:], re.S)
+            name = m.group(1) or m.group(2)
+            start, i = i, i + m.end()
+            if name == "tag":                      # \tag{Eq. 3} is printed "(Eq. 3)"
+                depth, j = 0, i
+                while j < n:
+                    depth += {"{": 1, "}": -1}.get(tex[j], 0)
+                    if depth == 0:
+                        break
+                    j += 1
+                out.append(("(", None))
+                out.extend((ch, i + 1 + k) for k, ch in enumerate(tex[i + 1:j]) if not ch.isspace())
+                out.append((")", None))
+                i = j + 1
+            elif name in _TEX_TRANSPARENT:
+                pass
+            elif name in _TEX_WORDS:
+                out.extend((ch, None) for ch in name)
+            elif name in _TEX_SYMBOLS and len(_TEX_SYMBOLS[name]) == 1 and _TEX_SYMBOLS[name] not in " {}":
+                out.append((_TEX_SYMBOLS[name], (start, i)))
+            elif name in _TEX_SYMBOLS:
+                out.extend((ch, None) for ch in _TEX_SYMBOLS[name] if not ch.isspace() and ch not in "{}")
+            else:
+                out.append(("\x00", None))         # unknown: never matches the text layer
+            continue
+        if c == "&":
+            m = re.match(r"&#?\w+;", tex[i:])
+            if m:
+                out.extend((ch, None) for ch in htmllib.unescape(m.group(0)))
+                i += m.end()
+                continue
+        if not (c.isspace() or c in "{}_^~"):
+            out.append((c, i))
+        i += 1
+    return out
+
+
+class _TextLayer:
+    """A page's (or region's) text without whitespace, indexed once for aligning
+    many formulas against it."""
+    CONTEXT = 30                                   # projected characters around a formula
+
+    def __init__(self, text):
+        self.text = text
+        self.folded = "".join(_mfold(c) for c in text)
+        self._sm = difflib.SequenceMatcher(None, autojunk=False)
+        self._sm.set_seq2(self.folded)
+        self.proj = ""
+
+    def align(self, chars, spans):
+        """Per formula: (offset, opcodes) of its stretch of the projection `chars`,
+        with context, against the text layer. Opcode i-indices are relative to the
+        stretch (self.proj), j-indices absolute. Formulas not found are skipped."""
+        whole = "".join(_mfold(c) for c, _ in chars)
+        for st, en in spans:
+            lo, hi = max(0, st - self.CONTEXT), min(len(whole), en + self.CONTEXT)
+            piece = whole[lo:hi]
+            if en - st < 1 or len(piece) < 4:
+                continue
+            self._sm.set_seq1(piece)
+            anchor = self._sm.find_longest_match(0, len(piece), 0, len(self.folded))
+            if anchor.size < min(12, 0.5 * len(piece)):
+                continue                           # not found on the page: leave it alone
+            j0 = max(0, anchor.b - anchor.a - 10)
+            j1 = min(len(self.folded), anchor.b + len(piece) - anchor.a + 10)
+            ops = difflib.SequenceMatcher(None, piece, self.folded[j0:j1], autojunk=False).get_opcodes()
+            self.proj = piece
+            yield lo, [(op, i1, i2, j0 + k1, j0 + k2) for op, i1, i2, k1, k2 in ops]
+
+
+# Glyphs of symbol fonts without a proper Unicode mapping (MathPi's "¼" for "=").
+_SYMBOL_JUNK = re.compile(r"[\x80-\xaf\xb8-\xbf\xd0\xde\xf0\xfe\ue000-\uf8ff\ufffd]")
+
+
+_MATH_ELEM = re.compile(r"(<math\b[^>]*>)(.*?)(</math>)", re.S)
+
+
+def _projection(html):
+    """An html block as plain text against the text layer: [(char, (math#, tex pos) or None)]
+    without whitespace, plus each formula's (start, end) in that list."""
+    chars, spans, pos = [], [], 0
+    for k, m in enumerate(_MATH_ELEM.finditer(html)):
+        chars.extend((c, None) for c in htmllib.unescape(re.sub(r"<[^>]+>", "", html[pos:m.start()]))
+                     if not c.isspace())
+        start = len(chars)
+        chars.extend((c, None if p is None else (k, p)) for c, p in _tex_chars(m.group(2)))
+        spans.append((start, len(chars)))
+        pos = m.end()
+    chars.extend((c, None) for c in htmllib.unescape(re.sub(r"<[^>]+>", "", html[pos:])) if not c.isspace())
+    return chars, spans
 
 
 # --------------------------------------------------------------------------- links
@@ -606,6 +743,9 @@ class Item:
     images: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)      # (note_id, html) defined after this item
     affiliations: list = field(default_factory=list)  # note htmls shown as a block after a byline
+    legend: list = field(default_factory=list)        # table: note htmls shown under the table
+    drawn: bool = False                                # table/equation: shown as the picture from the PDF
+    alt: str = ""                                      # equation shown as picture: its text-layer text
     md: str = ""
 
     @property
@@ -639,6 +779,11 @@ _CANON_MAP = str.maketrans({"‘": "'", "’": "'", "‚": "'", "′": "'", "“
 def _canon(word):
     """Comparison form: ligatures, quote/dash styles and hyphens do not count."""
     return unicodedata.normalize("NFKC", fix_text(word)).translate(_CANON_MAP).replace("-", "")
+
+
+def _fold(word):
+    """OCR look-alikes compare equal: accents dropped, digit 0 as letter o."""
+    return "".join(c for c in unicodedata.normalize("NFKD", word) if not unicodedata.combining(c)).replace("0", "o")
 
 
 def _word_edits(iw, i1, a, b):
@@ -739,7 +884,13 @@ class Converter:
                 if main is None and kt in IMAGE_TYPES | {"Table", "Form"}:
                     main = self._from_block(k, pnum, pb)
                 elif kt == "Caption":
-                    captions.append(restore_tags(k.get("html") or ""))
+                    html_k = restore_tags(k.get("html") or "")
+                    if captions and CAPTION_LABEL.match(html_plain(html_k)):
+                        # "Table 1.2-4: ..." grouped with Table 1.2-3: a caption of its
+                        # own, for the next uncaptioned table.
+                        rest.extend(self._from_block(k, pnum, pb))
+                    else:
+                        captions.append(html_k)
                 else:
                     rest.extend(self._from_block(k, pnum, pb))
             if not main:
@@ -793,7 +944,9 @@ class Converter:
                 by_page.setdefault(it.page, []).append(it)
         for page, its in by_page.items():
             try:
-                words = [fix_text(w) for w in self.an.page_words(page)]
+                # List bullets are markup in marker's text: as words they would make the
+                # last word of an item and the next item's first one a two-word edit.
+                words = [fix_text(w) for w in self.an.page_words(page) if w not in BULLETS]
             except Exception:
                 continue
             if not words:
@@ -816,6 +969,8 @@ class Converter:
                 sm = difflib.SequenceMatcher(None, item_canon, page_canon[j0:j1], autojunk=False)
                 for op, i1, i2, j1_, j2_ in sm.get_opcodes():
                     j1, j2 = j0 + j1_, j0 + j2_
+                    while i2 > i1 + 1 and iw[i2 - 1] in BULLETS:     # "tempera- ·" | "temperature."
+                        i2 -= 1
                     if op != "replace" or i2 - i1 > 3:
                         continue
                     if i1 == 0 or i2 == len(iw):
@@ -839,14 +994,191 @@ class Converter:
                     if not same_len_typo and difflib.SequenceMatcher(None, ca, cb).ratio() < 0.6:
                         continue
                     for old, new, nth in _word_edits(iw, i1, a, b):
-                        it.html, done = _replace_nth_word(it.html, old, new, nth)
-                        if it.kind == "list" and not done:
+                        if it.kind == "list":
+                            # Lists render from their items: edit the item holding the nth occurrence.
+                            done = False
                             for k, li in enumerate(it.children):
-                                it.children[k], done = _replace_nth_word(li, old, new, 0)
+                                it.children[k], done = _replace_nth_word(li, old, new, nth)
                                 if done:
                                     break
+                                nth -= len(re.findall(r"(?<!\S)" + re.escape(htmllib.escape(old, quote=False))
+                                                      + r"(?=[\s<]|$)", re.sub(r"<math\b.*?</math>", "", li, flags=re.S)))
+                            it.html = " ".join(it.children)
+                        else:
+                            it.html, done = _replace_nth_word(it.html, old, new, nth)
                         if done:
                             self._count("text_layer_corrections")
+
+    def _table_text_fix(self, items):
+        """Table cells against the text layer: marker drops range dots ("40 2" for
+        "40 ... 2", "0.1 1" for "0.1 ... 1") and misreads subscripted formulas
+        ("N," for "N2"). Only edits with an exact match on both sides are taken."""
+        if self.an is None:
+            return
+        try:
+            if not self.an.is_born_digital():
+                return
+        except Exception:
+            return
+        for it in items:
+            if it.kind != "table":
+                continue
+            try:
+                words = [fix_text(w) for w in self.an.region_words(it.page, it.bbox)]
+            except Exception:
+                continue
+            if not words:
+                # Text on a born-digital page that the PDF does not have is marker's OCR
+                # of a drawing (structural formulas etc.): the picture is the reliable copy.
+                it.drawn = len(it.text) >= 20
+                continue
+            parts = re.split(r"(<[^>]+>)", it.html)
+            slots, in_math = [], 0          # (part index, start, end) of each word outside tags/math
+            for i, part in enumerate(parts):
+                if part.startswith("<"):
+                    m = re.match(r"<(/?)math\b", part, re.I)
+                    if m:
+                        in_math = max(0, in_math + (-1 if m.group(1) else 1))
+                    continue
+                if not in_math:
+                    slots.extend((i, m.start(), m.end()) for m in re.finditer(r"\S+", part))
+            # Whole words only: a word split by <sub>/<sup> tags cannot be aligned.
+            tw = [htmllib.unescape(parts[i][st:en]) for i, st, en in slots]
+            ca, cb = [_canon(w).lower() for w in tw], [_canon(w).lower() for w in words]
+            edits = []                       # (slot index, new text)
+            for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, ca, cb, autojunk=False).get_opcodes():
+                left = i1 > 0 and j1 > 0 and ca[i1 - 1] == cb[j1 - 1]
+                right = i2 < len(ca) and j2 < len(cb) and ca[i2] == cb[j2]
+                if op == "insert" and left and right and j2 - j1 == 1 and words[j1] in ELLIPSES:
+                    edits.append((i1 - 1, tw[i1 - 1] + " " + words[j1]))
+                elif op == "replace":
+                    # The first word of the run next to a matching left word, the last
+                    # one next to a matching right word: "N," -> "N2", "CŌ," -> "CO2".
+                    pairs = ([(i1, j1)] if left else []) + ([(i2 - 1, j2 - 1)] if right else [])
+                    for i, j in dict(pairs).items():
+                        a, b = _fold(ca[i]), _fold(cb[j])
+                        diff = [k for k, (x, y) in enumerate(zip(a, b)) if x != y] if len(a) == len(b) else None
+                        # Short words: up to half the letters; longer ones: one punctuation
+                        # mark misread ("Ca(OH)," for "Ca(OH)2", "104.3*" for "104.3°").
+                        if (diff and a[:1] == b[:1]
+                                and (len(a) <= 4 and len(diff) <= max(1, len(a) // 2)
+                                     or len(diff) == 1 and not a[diff[0]].isalnum())
+                                and not re.search(r"[\ufffd\ue000-\uf8ff]", words[j])):
+                            edits.append((i, words[j]))
+            for k, new in sorted(edits, reverse=True):
+                i, st, en = slots[k]
+                parts[i] = parts[i][:st] + htmllib.escape(new, quote=False) + parts[i][en:]
+                self._count("text_layer_corrections")
+            if edits:
+                it.html = "".join(parts)
+
+    def _math_fix(self, items):
+        """marker reads formulas with an OCR model from the page image, even on
+        born-digital pages, and misreads small scripts: \\Delta_{yap} for ∆vap,
+        H_2O^+ for H3O+, K_{...} for Kw. Align each block (formulas flattened to
+        plain text) with the text layer and take its letters and digits where a
+        formula differs. A displayed equation that still differs (e.g. arrows the
+        text layer lacks) is shown as the picture from the PDF instead."""
+        if self.an is None:
+            return
+        try:
+            if not self.an.is_born_digital():
+                return
+        except Exception:
+            return
+        layers = {}
+
+        def page_layer(page):
+            if page not in layers:
+                try:
+                    words = [fix_text(w) for w in self.an.page_words(page) if w not in BULLETS]
+                except Exception:
+                    words = []
+                layers[page] = _TextLayer("".join(words))
+            return layers[page]
+
+        for it in items:
+            if it.kind not in ("para", "list", "caption", "footnote", "equation", "table"):
+                continue
+            if it.kind in ("equation", "table"):
+                # Padded: marker's boxes tend to cut off subscripts below the line.
+                region = (it.bbox[0] - 0.004, it.bbox[1] - 0.006, it.bbox[2] + 0.004, it.bbox[3] + 0.006)
+                try:
+                    layer = _TextLayer("".join(fix_text(w) for w in self.an.region_words(it.page, region)))
+                except Exception:
+                    continue
+            else:
+                layer = page_layer(it.page)
+            if not layer.text:
+                continue
+            if it.kind == "list":
+                it.children = [self._math_fix_html(li, layer)[0] for li in it.children]
+                it.html = " ".join(it.children)
+                continue
+            it.html, mismatch = self._math_fix_html(it.html, layer)
+            if mismatch and it.kind == "equation":
+                it.drawn = True
+                it.alt = " ".join(fix_text(w) for w in self.an.region_words(it.page, region))
+                self._count("equations_as_images")
+
+    def _math_fix_html(self, html, page):
+        """-> (html, mismatch): formulas in `html` patched from the text layer `page`
+        (a _TextLayer); mismatch if a formula still contradicts it afterwards."""
+        if "<math" not in html:
+            return html, False
+        texs = [m.group(2) for m in _MATH_ELEM.finditer(html)]
+        chars, spans = _projection(html)
+        edits = {}                                 # math# -> [(start, end, new)]
+        for lo, ops in page.align(chars, spans):
+            proj = page.proj
+            for op, i1, i2, j1, j2 in ops:
+                if op != "replace" or i2 - i1 > 3 or j2 - j1 > 3:
+                    continue
+                left = i1 > 0 and j1 > 0 and proj[i1 - 1] == page.folded[j1 - 1]
+                right = i2 < len(proj) and j2 < len(page.folded) and proj[i2] == page.folded[j2]
+                origins = [o for _, o in chars[lo + i1:lo + i2]]
+                if not (left and right) or None in origins or len({o[0] for o in origins}) != 1:
+                    continue                       # not (only) literal characters of one formula
+                k, positions = origins[0][0], [o[1] for o in origins]
+                new = page.text[j1:j2]
+                if isinstance(positions[0], tuple):
+                    # One symbol for another: "{}^{\\bullet}C" where the PDF has "°C".
+                    if len(positions) == 1 and new in _SYMBOL_TEX:
+                        edits.setdefault(k, []).append((*positions[0], "\\" + _SYMBOL_TEX[new] + " "))
+                    continue
+                if positions != list(range(positions[0], positions[0] + len(positions))):
+                    continue
+                old = texs[k][positions[0]:positions[-1] + 1]
+                if re.fullmatch(r"[A-Za-z0-9.]+", old) and re.fullmatch(r"[A-Za-z0-9]+", new):
+                    edits.setdefault(k, []).append((positions[0], positions[-1] + 1, new))
+        if edits:
+            parts, pos = [], 0
+            for k, m in enumerate(_MATH_ELEM.finditer(html)):
+                tex, prev_st = m.group(2), len(m.group(2)) + 1
+                # Neighbouring formulas' context windows overlap: the same edit can be
+                # found twice. Apply each once, and none that overlaps another.
+                for st, en, new in sorted(set(edits.get(k, [])), reverse=True):
+                    if en > prev_st:
+                        continue
+                    tex, prev_st = tex[:st] + new + tex[en:], st
+                    self._count("formula_corrections")
+                parts += [html[pos:m.start()], m.group(1), tex, m.group(3)]
+                pos = m.end()
+            html = "".join(parts) + html[pos:]
+            chars, spans = _projection(html)
+        # Still contradicting the text layer inside a formula? Letters and digits always
+        # count; symbols only where the text layer has no symbol-font junk ("I ¼ T ð2Þ").
+        trusted = not _SYMBOL_JUNK.search(page.text)
+        mismatch = False
+        for lo, ops in page.align(chars, spans):
+            for op, i1, i2, j1, j2 in ops:
+                if op == "equal" or not any(lo + i1 < en and (lo + i2 > st if i2 > i1 else lo + i1 > st)
+                                            for st, en in spans):
+                    continue
+                changed = _SYMBOL_JUNK.sub("", re.sub(r"[\s.,;:()]", "", page.proj[i1:i2] + page.folded[j1:j2]))
+                if re.search(r"\w", changed) or (changed and trusted):
+                    mismatch = True
+        return html, mismatch
 
     @staticmethod
     def _apply_scripts(html, patterns):
@@ -1148,6 +1480,15 @@ class Converter:
         first_page = min((it.page for it in flat), default=0)
         byline = max((c for c in flat if c.page == first_page and c.kind == "para"),
                      key=lambda c: c.html.count("<sup>"), default=None)
+        for it in flat:
+            # A contact address set at the end of a caption is the authors', not the figure's.
+            cap = it.caption
+            m = EMAIL.search(cap.html) if cap is not None and byline is not None else None
+            if m and not re.search(r"\w", re.sub(r"<[^>]+>", "", cap.html[m.end():])) and cap.text.strip() != m.group(0):
+                cap.html = cap.html[:m.start()].rstrip() + cap.html[m.end():]
+                byline.affiliations.append(m.group(0))
+                self._count("affiliations")
+        legend_of = None     # the table the previous note belonged to
         for idx, note in enumerate(list(flat)):
             if note.kind != "footnote":
                 continue
@@ -1163,6 +1504,22 @@ class Converter:
                          + r"]{1,3})|(\d{1,3})(?=\s))", html)
             mark = (m.group(1) or m.group(2) or m.group(3)) if m else None
             body = html[m.end():] if m else html
+            # Notes to a table ("1) ULLMANN (1996)") go under it: they have no anchor in the
+            # running text. A run of such notes continues the table even where its marks
+            # are combined ("2),3)").
+            table = None
+            if mark:
+                table = next((t for t in flat if t.kind == "table" and t.page == note.page
+                              and re.search(r"<sup>[^<]*?(?<![\w])" + re.escape(mark) + r"[^<]*</sup>", t.html)), None)
+            if table is None and legend_of is not None and legend_of.page == note.page and (
+                    mark or not note.text[:1].isalpha()):
+                table = legend_of
+            legend_of = table
+            if table is not None:
+                table.legend.append(note.html)
+                note.kind = "consumed"
+                self._count("table_notes")
+                continue
             note_seq += 1
             note_id = f"n{note_seq}"
             token = f"\x10{note_id}\x11"
@@ -1280,13 +1637,21 @@ class Converter:
             return None
 
         kinds = [kind_of(h.text) for h in heads]
-        numbered = [k for k in kinds if k]
-        top_marker = min((h.level for h, k in zip(heads, kinds) if k == "n1"), default=2)
         first = heads[0]
         title_idx = None
-        if kinds[0] is None and first.level == min(h.level for h in heads):
+        top = min(h.level for h in heads)
+        # A numbered chapter title ("1.2 The physicochemical properties of water")
+        # is still the title when it is the only heading in the largest type and
+        # opens the first page, before any body text.
+        lead = items[:items.index(first)]
+        sole_top = (first.page == min(it.page for it in items) and sum(h.level == top for h in heads) == 1
+                    and len(heads) > 1 and not any(it.kind == "para" and len(it.text) > 200 for it in lead))
+        if first.level == top and (kinds[0] is None or sole_top):
             title_idx = 0
             self.title = first.text
+            kinds[0] = None                  # its number is not a section level
+        numbered = [k for k in kinds if k]
+        top_marker = min((h.level for h, k in zip(heads, kinds) if k == "n1"), default=2)
         distinct = sorted({h.level for i, h in enumerate(heads) if i != title_idx})
         stack = []
         fixed_depth = {"n1": 0, "n2": 1, "n3": 2}
@@ -1391,6 +1756,11 @@ class Converter:
             if in_box:
                 return f"**{text}**"
             return "#" * it.level + " " + text
+        if it.kind == "equation" and it.drawn:
+            md = self._render_equation_image(it)
+            if md:
+                return md
+            it.drawn = False                    # no image: the formula as read
         if it.kind in ("para", "equation", "caption"):
             italic, bold = _style_coverage(it.html, ctx)
             if self.an is not None and len(it.text) >= 20:
@@ -1439,6 +1809,24 @@ class Converter:
             return "::: {.box}\n" + inner + "\n:::"
         return ""
 
+    def _render_equation_image(self, it):
+        """The equation as cropped from the PDF, at the size of the surrounding text."""
+        self._fig_count += 1
+        x0, y0, x1, y1 = it.bbox
+        rel = self._save_image(it, (x0 - 0.004, y0 - 0.006, x1 + 0.004, y1 + 0.006),
+                               f"p{it.page + 1}_eq{self._fig_count}")
+        if rel is None:
+            return None
+        style = ""
+        try:
+            em = self.an.glyph_height(it.page)
+            if em:
+                width_pt = (x1 - x0 + 0.008) * self.an.page_size(it.page)[0]
+                style = f' style="width:{width_pt / em:.1f}em"'
+        except Exception:
+            pass
+        return f"![{md_escape(it.alt)}]({rel}){{.equation-image{style}}}"
+
     def _render_table(self, it):
         tree = parse_html(it.html)
         table = _find(tree, "table")
@@ -1446,17 +1834,27 @@ class Converter:
         cap = self._caption_md(it)
         if cap:
             parts.append(escape_line_start(cap))
-        wide = table is not None and _table_columns(table) >= TABLE_IMAGE_MIN_COLS
-        if table is None or wide:
+        cols = _table_columns(table) if table is not None else 0
+        wide = cols >= TABLE_IMAGE_MIN_COLS
+        if table is None or wide or it.drawn:
             self._fig_count += 1
             x0, y0, x1, y1 = it.bbox
             rel = self._save_image(it, (x0 - 0.004, y0 - 0.004, x1 + 0.004, y1 + 0.004),
                                    f"p{it.page + 1}_table{self._fig_count}")
             if rel:
                 parts.append(f"![]({rel}){{.table-image}}")
-        if table is not None:
-            cls = "table-wrap table-wide" if wide else "table-wrap"
+        if table is not None and not it.drawn:
+            cls = "table-wrap table-wide" if cols >= TABLE_WIDE_COLS else "table-wrap"
             parts.append(f"::: {{.{cls.replace(' ', ' .')}}}\n```{{=html}}\n{safe_html(table)}\n```\n:::")
+        if it.legend:
+            ctx = self._ctx(it.page)
+            # Notes set side by side in the PDF arrive as one line: "3) GABALLA ... 4) KÁLMÁN ..."
+            lines = [line for h in it.legend
+                     for line in re.split(r"\s+(?=\^?\d{1,2}\)\^?\s)", inline_md(h, ctx)) if line.strip()]
+            lines = [re.sub(r"^(\^[^^\s]+\^)(?=\S)", r"\1 ", line) for line in lines]    # "^1)^ ULLMANN"
+            if any(line.startswith("^") for line in lines):     # the split-off "4) KÁLMÁN" likewise
+                lines = [re.sub(r"^(\d{1,2})\\?\)\s+", r"^\1)^ ", line) for line in lines]
+            parts.append("::: {.table-notes}\n" + "\n\n".join(escape_line_start(line) for line in lines) + "\n:::")
         self.stats["tables"] = self.stats.get("tables", 0) + 1
         return "::: {.table-block}\n" + "\n\n".join(parts) + "\n:::"
 
@@ -1508,6 +1906,12 @@ class Converter:
         open_idx = None
         for blk in blocks:
             it, md = blk
+            if (it.kind == "para" and open_idx is not None and len(md) < 300
+                    and re.fullmatch(r"\(.*\)", md.strip(), re.S) and not self._starts_continuation(md, out[open_idx][1])):
+                # "(The positive ions X+ are called cations ...)" set beside an equation:
+                # an aside, not the end of the paragraph it interrupts.
+                out.append(blk)
+                continue
             if it.kind == "para" and open_idx is not None:
                 prev_it, prev_md = out[open_idx]
                 drop_cap = re.fullmatch(r"\**[A-ZÀ-Þ]\**", prev_md) and md[:1].islower()
@@ -1546,6 +1950,8 @@ class Converter:
     def _convert(self, items):
         items = self._drop_noise(items)
         self._text_layer_fix(items)
+        self._table_text_fix(items)
+        self._math_fix(items)
         self._scripts(items)
         items = self._drop_caps(items)
         items = self._figures_and_captions(items)

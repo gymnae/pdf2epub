@@ -64,6 +64,7 @@ class PdfAnalyzer:
         self._body_style = None
         self._page_text = {}
         self._glyph_cache = {}
+        self._frames = {}
         self._body_font = ""
 
     def close(self):
@@ -88,10 +89,12 @@ class PdfAnalyzer:
 
     def _frame(self, index):
         """(left, top, width, height) of the visible page area in PDF user space."""
-        page = self.pdf[index]
-        left, _, _, top = page.get_bbox()
-        w, h = page.get_size()
-        return left, top, w or 1.0, h or 1.0
+        if index not in self._frames:              # per glyph in to_frac: loading the page is slow
+            page = self.pdf[index]
+            left, _, _, top = page.get_bbox()
+            w, h = page.get_size()
+            self._frames[index] = (left, top, w or 1.0, h or 1.0)
+        return self._frames[index]
 
     def to_frac(self, index, l, b, r, t):
         """PDF user-space box -> page fractions (top-left origin, visible area)."""
@@ -375,7 +378,9 @@ class PdfAnalyzer:
         """(size_pt, font, weight) of the PDF line where `text` starts, or None.
         Size is the median glyph height (half-point steps), font the one used by
         most of its glyphs, so headings of one class share a key."""
-        want = _norm(text)[:12]
+        # Long enough to tell "Dissolution of salts" from "Dissolution of gases";
+        # a heading broken over two lines still matches on its first line.
+        want = _norm(text)[:40]
         if len(want) < 3:
             return None
         cur, styles = [], []
@@ -428,6 +433,28 @@ class PdfAnalyzer:
         text = "".join(g[0] for g in self._glyphs(index))
         text = re.sub(r"[\ufffe\x02]\s*", "", text)
         return text.split()
+
+    def glyph_height(self, index):
+        """Median glyph height on a page in PDF points: the body text's size there."""
+        heights = [g[2] for g in self._glyphs(index) if not g[1] and g[0].strip() and g[2] > 0]
+        return statistics.median(heights) if heights else None
+
+    def region_words(self, index, rect):
+        """Words of the text layer whose glyphs lie inside `rect` (page fractions), in text order."""
+        words, cur = [], []
+        for g in self._glyphs(index) + [(" ", True, 0, 0, 0, 0, None, "", 0)]:
+            ch, box = g[0], g[6]
+            inside = False
+            if box is not None and ch.strip() and ch not in "￾\x02":
+                x0, y0, x1, y1 = self.to_frac(index, *box)
+                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                inside = rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]
+            if inside:
+                cur.append(ch)
+            elif ch not in "￾\x02" and cur:
+                words.append("".join(cur))
+                cur = []
+        return words
 
     def text_lines(self, index):
         """[(rect, chars, text)] per text line (rotated text yields one entry per glyph)."""

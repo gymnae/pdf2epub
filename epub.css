@@ -30,15 +30,21 @@ figcaption, .table-block > p { font-size: 0.85em; line-height: 1.35; text-align:
 /* Tables: real tables, scroll on readers that allow it, small type for wide ones */
 .table-block { margin: 1em 0; }
 .table-wrap { overflow-x: auto; }
-table { border-collapse: collapse; margin: 0.5em auto; font-size: 0.85em; }
+/* Many readers (Kobo, Apple Books) ignore overflow-x: keep tables within the
+   screen by letting long cell content wrap. */
+table { border-collapse: collapse; margin: 0.5em auto; font-size: 0.85em; max-width: 100%; }
 .table-wide table { font-size: 0.7em; }
-th, td { border: 1px solid currentColor; padding: 0.15em 0.35em; vertical-align: top; text-indent: 0; }
+th, td { border: 1px solid currentColor; padding: 0.15em 0.35em; vertical-align: top; text-indent: 0;
+  overflow-wrap: break-word; word-wrap: break-word; }
 th { font-weight: bold; }
+.table-notes p { font-size: 0.8em; text-indent: 0; margin: 0 0 0.15em; }
 
 /* Math */
 .math-display { display: block; text-align: center; margin: 0.6em 0; text-indent: 0; }
 svg.math-inline { overflow: visible; }
 code.tex { font-size: 0.9em; }
+/* An equation shown as the picture from the PDF (its text layer and the OCR disagreed) */
+img.equation-image { display: block; margin: 0.6em auto; max-width: 100%; height: auto; }
 
 /* References: hanging indent, no first-line indent */
 .references p { text-indent: -1.5em; padding-left: 1.5em; margin: 0 0 0.35em; font-size: 0.9em; }

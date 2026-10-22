@@ -21,7 +21,7 @@ import re
 import shutil
 import subprocess
 
-RENDER_VERSION = "3-ziamath"
+RENDER_VERSION = "4-ziamath"
 FONT_PX = 12.0          # rendering size; SVG sizes are converted to em relative to it
 CHUNK_SIZE = int(os.environ.get("MATH_CHUNK_SIZE", "50"))
 WORKERS = int(os.environ.get("MATH_WORKERS", str(min(4, os.cpu_count() or 1))))
@@ -66,9 +66,9 @@ def _finish_svg(svg, tex, display):
     root_end = svg.index(">") + 1
     svg = re.sub(r'\s(width|height)="[^"]*"', "", svg[:root_end]) + svg[root_end:]
     svg = re.sub(r'(fill|stroke)="(#000000|#000|black)"', r'\1="currentColor"', svg)
-    style = f"display:inline-block;vertical-align:{-depth / FONT_PX:.3f}em"
-    if display:
-        style += ";max-width:100%"
+    # max-width on inline formulas too: in a table cell a wide one would push the
+    # table off the screen (and lets the cell shrink below the formula's width).
+    style = f"display:inline-block;vertical-align:{-depth / FONT_PX:.3f}em;max-width:100%"
     label = html.escape(tex, quote=True)
     return svg.replace("<svg ", f'<svg width="{w / FONT_PX:.3f}em" height="{h / FONT_PX:.3f}em" '
                                f'style="{style}" fill="currentColor" role="img" aria-label="{label}" '

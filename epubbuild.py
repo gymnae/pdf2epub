@@ -14,6 +14,9 @@ import tempfile
 import mathrender
 
 MD_FORMAT = "markdown-smart"
+# Sections shorter than this on average are an article's, not a book's chapters:
+# a file (= page break) per section would leave half-empty screens.
+CHAPTER_MIN_CHARS = int(os.environ.get("CHAPTER_MIN_CHARS", "12000"))
 _RAW_MATH = re.compile(r'<math display="(inline|block)">(.*?)</math>', re.S)
 
 
@@ -85,6 +88,12 @@ def _replace_math(ast, svgs, mathml):
     _walk(ast, visit)
 
 
+def _split_level(md_text):
+    """2 (one file per ## section) for books, 1 for articles and short documents."""
+    sections = len(re.findall(r"^## ", md_text, re.M))
+    return 2 if sections and len(md_text) / sections >= CHAPTER_MIN_CHARS else 1
+
+
 def kepubify(epub_path, out_path):
     """Real Kobo kepub via kepubify (adds koboSpan markup). Returns True on success."""
     exe = shutil.which("kepubify")
@@ -125,7 +134,9 @@ def build_epub(md_path, out_epub, resource_dirs, metadata_file, css=None, cover=
     with open(ast_path, "w", encoding="utf-8") as f:
         json.dump(ast, f)
     major, minor = pandoc_version()
-    split_flag = "--split-level=2" if (major, minor) >= (3, 0) else "--epub-chapter-level=2"
+    with open(md_path, encoding="utf-8") as f:
+        level = _split_level(f.read())
+    split_flag = f"--split-level={level}" if (major, minor) >= (3, 0) else f"--epub-chapter-level={level}"
     cmd = ["pandoc", ast_path, "-f", "json", "-o", out_epub, "-t", "epub3", split_flag,
            "--standalone", "--mathml", f"--resource-path={resource_path}",
            f"--metadata-file={metadata_file}"]

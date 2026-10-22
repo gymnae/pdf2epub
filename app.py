@@ -28,7 +28,7 @@ os.makedirs(LIBRARY_BASE_DIR, exist_ok=True)
 
 # Bump when the PDF -> Markdown structure step changes, so cached extractions
 # are re-structured (cheap, no GPU) instead of reusing stale Markdown.
-STRUCTURE_VERSION = "7"
+STRUCTURE_VERSION = "8"
 
 GPU_WAIT_TIMEOUT_S = int(os.environ.get("GPU_WAIT_TIMEOUT_S", "900"))
 GPU_POLL_S = int(os.environ.get("GPU_POLL_S", "15"))
@@ -373,9 +373,25 @@ def _summary(stats):
               ("text_layer_corrections", "misread characters corrected from the PDF text"),
               ("headings_promoted", "headings recognised from the typography"),
               ("affiliations", "affiliations placed under the authors"),
-              ("references_rejoined", "split references re-joined")]
+              ("references_rejoined", "split references re-joined"),
+              ("table_notes", "table notes placed under their table"),
+              ("formula_corrections", "misread formula characters corrected from the PDF text"),
+              ("equations_as_images", "equations shown as images (formula reading unreliable)")]
     parts = [f"{stats[k]} {label}" for k, label in labels if stats.get(k)]
     return ", ".join(parts)
+
+
+def _alnum(text):
+    return re.sub(r"[\W_]+", "", text).lower()
+
+
+def _drop_stray_metadata(meta, md_text):
+    """PDF Title/Subject fields often hold a layout job name ("beddig") or a file
+    name instead of the real title: keep them only if they occur in the text."""
+    body = _alnum(md_text)
+    for key in list(meta):
+        if key.lower() in ("title", "subject") and _alnum(str(meta[key]))[:40] not in body:
+            del meta[key]
 
 
 def extract_markdown(pdf_file, force_ocr):
@@ -439,6 +455,7 @@ def extract_markdown(pdf_file, force_ocr):
 
         yield busy("🧩 Rebuilding document structure (footnotes, figures, boxes, styling)…", work_dir)
         md_content, title, stats = _structure(json_path, archive_pdf_path, work_dir, base_name)
+        _drop_stray_metadata(extracted_metadata, md_content)
         if title and not any(k.lower() == "title" for k in extracted_metadata):
             extracted_metadata["title"] = title
         if os.path.exists(edited_md):
@@ -483,13 +500,18 @@ def build_epub(md_text, metadata_dict, include_toc, math_mode, work_dir, base_na
             epub_meta['title'] = base_name
 
         key_map = {
-            'title': 'title', 'author': 'creator', 'creator': 'creator',
+            'title': 'title', 'author': 'creator',
             'subject': 'description', 'description': 'description',
             'keywords': 'keywords', 'creationdate': 'date'
         }
+        # A PDF's Creator/Producer name the authoring software ("Adobe PageMaker 6.5"),
+        # not a person: as EPUB creator they would replace the author.
+        skip = {'creator', 'producer', 'moddate', 'trapped'}
 
         for k, v in metadata_dict.items():
             k_lower = k.lower()
+            if k_lower in skip:
+                continue
             target_key = key_map.get(k_lower, k_lower)
             if k_lower == 'creationdate' and str(v).startswith('D:'):
                 v = str(v)[2:6]

@@ -31,18 +31,18 @@ jobs:
           sudo docker image prune --all --force
           df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Lint Python sources
         run: |
           python3 -m pip install --quiet pyflakes
           python3 -m pyflakes *.py
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -50,7 +50,7 @@ jobs:
 
       - name: Image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -64,7 +64,7 @@ jobs:
       # Layer cache lives in the registry: the torch layer alone is larger than
       # what fits comfortably in the 10 GB GitHub Actions cache.
       - name: Build and load for testing
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
@@ -83,7 +83,7 @@ jobs:
       # Only reached when the self-test passed; all layers come from the builder cache.
       - name: Push
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64

@@ -78,13 +78,23 @@ def epub_roundtrip():
     return f"{len(names)} files in EPUB"
 
 
-def writable_dirs():
-    import surya.settings as s
-    font_dir = getattr(s.settings, "FONT_DIR", None)
-    target = os.path.dirname(font_dir) if font_dir else None
-    if target and not os.access(target, os.W_OK):
-        raise PermissionError(f"{target} not writable (surya downloads fonts there)")
-    return target or ""
+def marker_font():
+    """marker writes this font on every start if missing; the venv is read-only."""
+    from marker.settings import settings
+    path = settings.FONT_PATH
+    if os.path.exists(path) and os.path.getsize(path) > 1_000_000:
+        return path
+    if os.access(os.path.dirname(path) if os.path.isdir(os.path.dirname(path)) else "/", os.W_OK):
+        return f"missing, but {os.path.dirname(path)} is writable (downloaded on first run)"
+    raise FileNotFoundError(f"{path} missing and not writable – marker would fail at startup")
+
+
+def writable():
+    dirs = [os.environ.get("LIBRARY_DIR", "/app/library"), os.environ.get("HOME", ""), tempfile.gettempdir()]
+    bad = [d for d in dirs if d and not os.access(d, os.W_OK)]
+    if bad:
+        raise PermissionError("not writable: " + ", ".join(bad))
+    return ", ".join(d for d in dirs if d)
 
 
 if __name__ == "__main__":
@@ -97,6 +107,7 @@ if __name__ == "__main__":
         check("app modules", imports("epubbuild", "gpu", "mathrender", "pdfanalysis", "structure", "gradio", "pynvml")),
         check("math → SVG", math_svg),
         check("markdown → EPUB → kepub", epub_roundtrip),
-        check("surya font dir writable", writable_dirs),
+        check("marker font baked in", marker_font),
+        check("runtime dirs writable", writable),
     ]
     sys.exit(0 if all(results) else 1)

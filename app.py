@@ -29,7 +29,7 @@ os.makedirs(LIBRARY_BASE_DIR, exist_ok=True)
 
 # Bump when the PDF -> Markdown structure step changes, so cached extractions
 # are re-structured (cheap, no GPU) instead of reusing stale Markdown.
-STRUCTURE_VERSION = "10"
+STRUCTURE_VERSION = "11"
 
 GPU_WAIT_TIMEOUT_S = int(os.environ.get("GPU_WAIT_TIMEOUT_S", "900"))
 GPU_POLL_S = int(os.environ.get("GPU_POLL_S", "15"))
@@ -439,7 +439,8 @@ def _summary(stats):
               ("references_rejoined", "split references re-joined"),
               ("table_notes", "table notes placed under their table"),
               ("formula_corrections", "misread formula characters corrected from the PDF text"),
-              ("equations_as_images", "equations shown as images (formula reading unreliable)")]
+              ("equations_as_images", "equations shown as images (formula reading unreliable)"),
+              ("tables_as_images", "tables shown as images (cells unreadable)")]
     parts = [f"{stats[k]} {label}" for k, label in labels if stats.get(k)]
     return ", ".join(parts)
 

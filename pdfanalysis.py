@@ -52,6 +52,9 @@ LIGATURE_RARE = {"b", "h", "j", "k"}   # only some fonts have fb/fh/fj/fk: need 
 LIGATURE_WIDE = 1.35        # such a glyph is ~1.7-2x as wide as the letter alone
 LIGATURE_FIT = 0.95         # ... and 3-8% narrower than its letters side by side
 LIGATURE_SLACK = 0.07       # widths closer than this don't decide (fi/fl; italics vary more)
+# Symbol fonts whose ToUnicode map gives the wrong character (Taylor & Francis'
+# "Advent" PDFs: "0.01 20.02" for "0.01 −0.02", "28C" for "2°C").
+SYMBOL_FONT_CHARS = {"AdvPS7DA6": {"2": "−", "8": "°"}}
 INK_DELTA = 24              # grey-level difference from the page background that counts as drawn
 CAPTION_START = re.compile(
     r"\s*(fig(ure|ura)?|figs?|tab(le|la|leau|elle)?|plate|chart|map|scheme|exhibit|illustration|"
@@ -95,20 +98,46 @@ class PdfAnalyzer:
 
     def page_text(self, index):
         if index not in self._page_text:
-            tp = self.pdf[index].get_textpage()
-            self._page_text[index] = tp.get_text_bounded()
+            glyphs = self._glyphs(index)
+            if any(g[7] in SYMBOL_FONT_CHARS for g in glyphs):
+                self._page_text[index] = "".join(g[0] for g in glyphs)    # with the repaired characters
+            else:
+                self._page_text[index] = self.pdf[index].get_textpage().get_text_bounded()
         return self._page_text[index]
+
+    def rotation(self, index):
+        """The page's /Rotate in degrees (clockwise): 90/270 for landscape pages stored sideways."""
+        return self._frame(index)[4]
 
     # ------------------------------------------------------------ coordinates
 
     def _frame(self, index):
-        """(left, top, width, height) of the visible page area in PDF user space."""
+        """(left, top, width, height) of the visible page area in display space (see
+        _to_display), plus the page's /Rotate and its unrotated box."""
         if index not in self._frames:              # per glyph in to_frac: loading the page is slow
             page = self.pdf[index]
-            left, _, _, top = page.get_bbox()
-            w, h = page.get_size()
-            self._frames[index] = (left, top, w or 1.0, h or 1.0)
+            left, bottom, right, top = page.get_bbox()
+            rot = page.get_rotation()
+            if rot:
+                # Display space: origin at the displayed page's bottom left, as marker sees it.
+                w, h = (top - bottom, right - left) if rot in (90, 270) else (right - left, top - bottom)
+                self._frames[index] = (0.0, h, w or 1.0, h or 1.0, rot, (left, bottom, right, top))
+            else:
+                w, h = page.get_size()
+                self._frames[index] = (left, top, w or 1.0, h or 1.0, 0, None)
         return self._frames[index]
+
+    def _to_display(self, index, l, b, r, t):
+        """A user-space box as seen on the displayed page. Pages with /Rotate (landscape
+        tables) are stored sideways; marker and the renderer work on the displayed page."""
+        rot, unrotated = self._frame(index)[4:]
+        if not rot:
+            return l, b, r, t
+        L, B, R, T = unrotated
+        pt = {90: lambda x, y: (y - B, R - x), 180: lambda x, y: (R - x, T - y),
+              270: lambda x, y: (T - y, x - L)}[rot]
+        (x0, y0), (x1, y1) = pt(l, b), pt(r, t)
+        return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
 
     def visible_frame(self, index):
         """(dx, dy, w, h, media_w, media_h): the visible area within the MediaBox, in
@@ -117,27 +146,29 @@ class PdfAnalyzer:
         page = self.pdf[index]
         if page.get_rotation():
             return None
-        left, top, w, h = self._frame(index)
+        left, top, w, h = self._frame(index)[:4]
         ml, mb, mr, mt = page.get_mediabox()
         return left - ml, mt - top, w, h, mr - ml, mt - mb
 
     def to_frac(self, index, l, b, r, t):
-        """PDF user-space box -> page fractions (top-left origin, visible area)."""
-        left, top, w, h = self._frame(index)
+        """Display-space box (see _to_display) -> page fractions (top-left origin, visible area)."""
+        left, top, w, h = self._frame(index)[:4]
         return ((l - left) / w, (top - t) / h, (r - left) / w, (top - b) / h)
 
     # ---------------------------------------------------- glyph-level text
 
     def _glyphs(self, index):
         """[(char, generated, height, origin_x, origin_y, right, (l, b, r, t), font, weight)]
-        in text order, PDF user space. Height is the loose (font ascent-descent) box, so it
-        tracks the effective font size even where FPDFText_GetFontSize ignores the
-        text matrix."""
+        in text order, display space (_to_display). Height is the loose (font ascent-descent)
+        box, so it tracks the effective font size even where FPDFText_GetFontSize ignores
+        the text matrix."""
         if index in self._glyph_cache:
             return self._glyph_cache[index]
         tp = self.pdf[index].get_textpage()
+        rotated = bool(self._frame(index)[4])
         out = []
         x, y = ctypes.c_double(), ctypes.c_double()
+        matrix = pdfium_c.FS_MATRIX()
         name_buf, flags = ctypes.create_string_buffer(128), ctypes.c_int()
         for i in range(tp.count_chars()):
             code = pdfium_c.FPDFText_GetUnicode(tp.raw, i)
@@ -145,9 +176,25 @@ class PdfAnalyzer:
             gen = pdfium_c.FPDFText_IsGenerated(tp.raw, i) == 1
             l, b, r, t = tp.get_charbox(i, loose=True)
             pdfium_c.FPDFText_GetCharOrigin(tp.raw, i, ctypes.byref(x), ctypes.byref(y))
+            if rotated and r - l < 1e-6 and t - b < 1e-6 and ch.strip() \
+                    and pdfium_c.FPDFText_GetMatrix(tp.raw, i, ctypes.byref(matrix)):
+                # pdfium's loose box collapses to a point for text set sideways: rebuild it
+                # from the glyph's em (0.24 em below the baseline, 0.76 above) along the
+                # text's up direction, and its ink along the line.
+                up = math.hypot(matrix.c, matrix.d)
+                em = pdfium_c.FPDFText_GetFontSize(tp.raw, i) * up
+                if em > 0:
+                    ux, uy = matrix.c / up, matrix.d / up
+                    tl, tb, tr, tt = tp.get_charbox(i)
+                    xs = [tl, tr, x.value - 0.24 * em * ux, x.value + 0.76 * em * ux]
+                    ys = [tb, tt, y.value - 0.24 * em * uy, y.value + 0.76 * em * uy]
+                    l, b, r, t = min(xs), min(ys), max(xs), max(ys)
+            l, b, r, t = self._to_display(index, l, b, r, t)
+            ox, oy = self._to_display(index, x.value, y.value, x.value, y.value)[:2]
             n = pdfium_c.FPDFText_GetFontInfo(tp.raw, i, name_buf, 128, ctypes.byref(flags))
             font = _font_base(name_buf.value.decode("latin1", "replace")) if n else ""
-            out.append((ch, gen, t - b, x.value, y.value, r, (l, b, r, t), font,
+            ch = SYMBOL_FONT_CHARS.get(font, {}).get(ch, ch)
+            out.append((ch, gen, t - b, ox, oy, r, (l, b, r, t), font,
                         pdfium_c.FPDFText_GetFontWeight(tp.raw, i)))
         self._glyph_cache[index] = out
         if len(self._glyph_cache) > 4:            # passes revisit nearby pages; keep a few
@@ -393,7 +440,7 @@ class PdfAnalyzer:
                 lambda: pdfium_c.FPDFTextObj_GetText(obj.raw, tp.raw, None, 0),
                 lambda b, n: pdfium_c.FPDFTextObj_GetText(obj.raw, tp.raw, b, n))
             if text:
-                out.append((key, text, obj.get_pos()))
+                out.append((key, text, self._to_display(index, *obj.get_pos())))
         return out
 
     def _partial_word(self, index, pos):
@@ -763,12 +810,10 @@ class PdfAnalyzer:
         irrelevant. `others` are the boxes of the page's other figures/tables: if one
         overlaps `rect`, the start is narrowed to the band of ink (split at blank
         rows) that belongs to `rect` rather than to them. Returns page fractions,
-        or None if `rect` holds no ink, the page is rotated (frames would not match)
-        or it has no text layer (a pure scan: text could not be told from figure)."""
+        or None if `rect` holds no ink or the page has no text layer (a pure scan: text
+        could not be told from figure)."""
         from PIL import ImageDraw
         page = self.pdf[index]
-        if page.get_rotation():
-            return None
         lines = self.text_lines(index)
         if not lines:
             return None
@@ -917,7 +962,7 @@ class PdfAnalyzer:
         W, H = page.get_size()
         rects = []
         for obj in page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_PATH], max_depth=0):
-            l, b, r, t = obj.get_pos()
+            l, b, r, t = self._to_display(index, *obj.get_pos())
             w, h = r - l, t - b
             if w < 0.25 * W or h < 0.04 * H or w * h > 0.9 * W * H:
                 continue
@@ -942,10 +987,9 @@ class PdfAnalyzer:
     # ---------------------------------------------------------------- figures
 
     def render_region(self, index, rect, dpi=220, max_px=1600, pad=0.004):
-        """Render a page region (fractions, top-left origin) to a PIL image."""
+        """Render a page region (fractions of the displayed page, top-left origin) to a
+        PIL image. pdfium applies the page's /Rotate, so crops are in display space too."""
         page = self.pdf[index]
-        if page.get_rotation():
-            return None
         W, H = page.get_size()
         x0, y0, x1, y1 = (max(0.0, rect[0] - pad), max(0.0, rect[1] - pad),
                           min(1.0, rect[2] + pad), min(1.0, rect[3] + pad))

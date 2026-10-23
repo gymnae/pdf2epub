@@ -48,7 +48,7 @@ DROP_TYPES = {"PageHeader", "PageFooter", "TableOfContents", "Reference", "Line"
 REFERENCE_HEADINGS = re.compile(
     r"^\W*(references|bibliography|literature( cited)?|works cited|sources|literatur(verzeichnis)?|"
     r"quellen(verzeichnis)?|références|bibliografía)\W*$", re.I)
-FOOTNOTE_SYMBOLS = "*†‡§¶‖"
+FOOTNOTE_SYMBOLS = "*∗†‡§¶‖"
 BULLETS = {"•", "●", "▪", "◦", "‣", "∙", "·"}
 ELLIPSES = {"...", "…", "–", "-"}
 CAPTION_LABEL = re.compile(r"^\W*(fig(ure)?|tab(le)?|abb(ildung)?|tabelle|plate|chart|scheme)\.?\s*[\dIVXS]", re.I)
@@ -859,6 +859,18 @@ def _find(node, tag):
         if hit is not None:
             return hit
     return None
+
+
+TABLE_NOTE_START = re.compile(r"\s*(notes?|sources?|quellen?|anmerkungen?|anm\.)\s*:", re.I)
+
+
+def _shredded_table(html):
+    """marker read the cells a few letters at a time ("W<br>k<br>in<br>b<br>i ..." for
+    "Weak sustainability"), as it does with tables set sideways."""
+    cells = re.findall(r"<t[hd]\b[^>]*>(.*?)</t[hd]>", html, re.S)
+    broken = [c for c in cells if len(re.findall(r"<br\s*/?>", c)) >= 3]
+    frags = [f for c in broken for f in (html_plain(x).strip() for x in re.split(r"<br\s*/?>", c)) if f]
+    return len(broken) >= 3 and len(frags) >= 20 and sum(len(f) <= 2 for f in frags) >= 0.6 * len(frags)
 
 
 def _table_columns(table):
@@ -1752,6 +1764,13 @@ class Converter:
                 cap.html = cap.html[:m.start()].rstrip() + cap.html[m.end():]
                 byline.affiliations.append(m.group(0))
                 self._count("affiliations")
+        for i, it in enumerate(flat[:-1]):
+            nxt = flat[i + 1]
+            if it.kind == "table" and nxt.kind == "para" and nxt.page == it.page and TABLE_NOTE_START.match(nxt.text):
+                # "Notes: All explanatory variables ..." set under a table explains it.
+                it.legend.append(nxt.html)
+                nxt.kind = "consumed"
+                self._count("table_notes")
         legend_of = None     # the table the previous note belonged to
         for idx, note in enumerate(list(flat)):
             if note.kind != "footnote":
@@ -1778,6 +1797,11 @@ class Converter:
             if table is None and legend_of is not None and legend_of.page == note.page and (
                     mark or not note.text[:1].isalpha()):
                 table = legend_of
+            if table is None and mark and not mark.isdigit():
+                # "∗Significance of 90%." under a table shown as a picture (its marks are in
+                # the image) or one that already has notes.
+                table = next((t for t in flat if t.kind == "table" and t.page == note.page and (t.drawn or t.legend)
+                              and t.bbox[3] <= note.bbox[1] + 0.01), None)
             legend_of = table
             if table is not None:
                 table.legend.append(note.html)
@@ -2320,6 +2344,28 @@ class Converter:
         last = re.search(r"(?<![\w.])([A-Za-zÀ-ÿ]+)$", tail)
         return bool(last) and last.group(1).lower() in CONTINUATION_WORDS and len(tail) >= 80
 
+    # ---- marker output that can't be trusted
+
+    def _unreliable_markup(self, items):
+        """Shredded tables are shown as the picture from the PDF only. On pages set
+        sideways marker's sub/superscripts are guesses from unrotated positions ("with
+        <sup>a</sup> time lag"): dropped, _scripts restores the real ones from the PDF."""
+        for it in items:
+            if it.kind == "table":
+                if not it.drawn and _shredded_table(it.html):
+                    it.drawn = True
+                    self._count("tables_as_images")
+                continue
+            try:
+                rotated = self.an is not None and self.an.rotation(it.page)
+            except Exception:
+                rotated = False
+            if not rotated or it.kind not in ("para", "heading", "list", "caption", "footnote"):
+                continue
+            strip = lambda h: re.sub(r"</?su[bp]>", "", h)
+            it.html = strip(it.html)
+            it.children = [strip(c) if isinstance(c, str) else c for c in it.children]
+
     # ---- lists
 
     def _body_lines(self, page):
@@ -2505,6 +2551,7 @@ class Converter:
 
     def _convert(self, items):
         items = self._drop_noise(items)
+        self._unreliable_markup(items)
         self._ligature_fix(items)
         self._text_layer_fix(items)
         self._table_text_fix(items)

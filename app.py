@@ -12,6 +12,7 @@ import json
 import queue
 import threading
 import time
+import zipfile
 import gradio as gr
 
 import gpu
@@ -28,7 +29,7 @@ os.makedirs(LIBRARY_BASE_DIR, exist_ok=True)
 
 # Bump when the PDF -> Markdown structure step changes, so cached extractions
 # are re-structured (cheap, no GPU) instead of reusing stale Markdown.
-STRUCTURE_VERSION = "9"
+STRUCTURE_VERSION = "10"
 
 GPU_WAIT_TIMEOUT_S = int(os.environ.get("GPU_WAIT_TIMEOUT_S", "900"))
 GPU_POLL_S = int(os.environ.get("GPU_POLL_S", "15"))
@@ -78,15 +79,23 @@ def reset_ui():
     )
 
 
-def enable_start_btn(file): return gr.update(interactive=True) if file is not None else gr.update(interactive=False)
+def enable_start_btn(file): return gr.update(interactive=bool(file))
 
 
-_ACTIVE_PROCS = set()
+# marker process -> the job ("wizard" or "bulk") that started it, so each Stop
+# button only stops its own job.
+_ACTIVE_PROCS = {}
+
+
+def _stop_job(owner):
+    for proc, proc_owner in list(_ACTIVE_PROCS.items()):
+        if proc_owner == owner:
+            _kill_group(proc)
+    _MARKER_QUEUE.cancel(owner)
 
 
 def cancel_ui():
-    for proc in list(_ACTIVE_PROCS):
-        _kill_group(proc)
+    _stop_job("wizard")
     return (gr.update(visible=True, interactive=True), gr.update(visible=False), gr.update(interactive=True), "🛑 Extraction cancelled.", gr.update(visible=False))
 
 
@@ -194,7 +203,7 @@ def _lower_priority():
         pass
 
 
-def _spawn_marker(pdf_path, out_dir, plan, force_ocr, disable_ocr, log):
+def _spawn_marker(pdf_path, out_dir, plan, force_ocr, disable_ocr, log, owner):
     """Run marker_single once. Generator yielding log text; returns (returncode, oom, peak_gib)."""
     cfg = dict(plan.config)
     if force_ocr:
@@ -221,7 +230,7 @@ def _spawn_marker(pdf_path, out_dir, plan, force_ocr, disable_ocr, log):
         cmd = ["ionice", "-c2", "-n7"] + cmd
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                bufsize=1, env=env, start_new_session=True, preexec_fn=_lower_priority)
-    _ACTIVE_PROCS.add(process)
+    _ACTIVE_PROCS[process] = owner
     q = queue.Queue()
     threading.Thread(target=enqueue_output, args=(process.stdout, q), daemon=True).start()
 
@@ -247,7 +256,7 @@ def _spawn_marker(pdf_path, out_dir, plan, force_ocr, disable_ocr, log):
         process.wait()
     finally:
         _kill_group(process)
-        _ACTIVE_PROCS.discard(process)
+        _ACTIVE_PROCS.pop(process, None)
     peak_gib = (peak - base_used) / gpu.GiB if base_used is not None else None
     return process.returncode, oom, peak_gib
 
@@ -280,11 +289,65 @@ class _Log:
         return "\n".join(self.lines[-15:])
 
 
-def run_marker(pdf_path, out_dir, force_ocr, born_digital):
-    """Generator yielding status text. Waits for the GPU when it is occupied by
-    something else (no negotiation possible), shrinks batches after an OOM, and
-    falls back to CPU where that makes sense."""
+class _MarkerQueue:
+    """First come, first served: one marker run at a time across all jobs (wizard
+    and bulk). Everything that doesn't need marker runs in parallel."""
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._tickets = []
+
+    def turn(self, owner, log):
+        """Generator yielding status text while waiting; returns the ticket once it's this
+        job's turn. The caller must release(ticket) afterwards."""
+        ticket = (owner, object())
+        with self._cond:
+            self._tickets.append(ticket)
+        try:
+            while True:
+                with self._cond:
+                    if ticket not in self._tickets:
+                        raise RuntimeError("Cancelled while queued.")
+                    ahead = self._tickets.index(ticket)
+                    if ahead == 0:
+                        return ticket
+                    self._cond.wait(timeout=2.0)
+                yield log.add(f"⏸ Queued for the extractor – {ahead} job(s) ahead…")
+        except BaseException:
+            self.release(ticket)
+            raise
+
+    def release(self, ticket):
+        with self._cond:
+            if ticket in self._tickets:
+                self._tickets.remove(ticket)
+            self._cond.notify_all()
+
+    def cancel(self, owner):
+        """Drop a stopped job's tickets: Gradio may never resume (and so never close)
+        its generator, which would otherwise hold the queue."""
+        with self._cond:
+            self._tickets = [t for t in self._tickets if t[0] != owner]
+            self._cond.notify_all()
+
+
+_MARKER_QUEUE = _MarkerQueue()
+
+
+def run_marker(pdf_path, out_dir, force_ocr, born_digital, owner):
+    """Generator yielding status text. Takes its turn in the marker queue, then
+    runs marker."""
     log = _Log("⏳ Heavy extraction (this may take a while)…")
+    ticket = yield from _MARKER_QUEUE.turn(owner, log)
+    try:
+        yield from _run_marker(pdf_path, out_dir, force_ocr, born_digital, log, owner)
+    finally:
+        _MARKER_QUEUE.release(ticket)
+
+
+def _run_marker(pdf_path, out_dir, force_ocr, born_digital, log, owner):
+    """Waits for the GPU when it is occupied by something else (no negotiation
+    possible), shrinks batches after an OOM, and falls back to CPU where that
+    makes sense."""
     cpu_allowed = CPU_FALLBACK == "always" or (CPU_FALLBACK == "auto" and born_digital and not force_ocr)
     scale, waited, force_cpu = 1.0, 0, False
     while True:
@@ -306,7 +369,7 @@ def run_marker(pdf_path, out_dir, force_ocr, born_digital):
         where = (f"GPU – {plan.reason}" if plan.device == "cuda"
                  else f"CPU ({CPU_THREADS} threads{', text layer only' if disable_ocr else ''}) – {plan.reason}")
         yield log.add(f"▶ Running on {where}")
-        rc, oom, peak = yield from _spawn_marker(pdf_path, out_dir, plan, force_ocr, disable_ocr, log)
+        rc, oom, peak = yield from _spawn_marker(pdf_path, out_dir, plan, force_ocr, disable_ocr, log, owner)
         if peak is not None:
             yield log.add(f"ℹ GPU memory peak during run: +{peak:.1f} GiB (working budget {plan.budget_gb:.1f} GiB)")
         if rc == 0:
@@ -404,84 +467,174 @@ def _drop_stray_metadata(meta, md_text):
             del meta[key]
 
 
+def _upload_path(f):
+    """Gradio hands uploads over as path strings or tempfile wrappers, depending on version."""
+    return getattr(f, "name", f)
+
+
+def _relay(gen, wrap):
+    """Yield wrap(*item) for each item of gen and return gen's return value;
+    closing the caller (Stop button) closes gen, which stops marker."""
+    try:
+        while True:
+            try:
+                item = next(gen)
+            except StopIteration as stop:
+                return stop.value
+            yield wrap(*item)
+    finally:
+        gen.close()
+
+
+def _extract(pdf_path, force_ocr, owner):
+    """PDF -> Markdown in the library cache. Generator yielding (status, work_dir);
+    returns (work_dir, base_name, metadata, md_content, md_file, status)."""
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    extracted_metadata = {}
+    yield "⚡ Analyzing PDF & Extracting Metadata...", None
+
+    file_hash = get_smart_hash(pdf_path)
+    session_dir = os.path.join(LIBRARY_BASE_DIR, file_hash)
+    work_dir = os.path.join(session_dir, "ocr" if force_ocr else "auto")
+    os.makedirs(work_dir, exist_ok=True)
+    archive_pdf_path = os.path.join(session_dir, f"{base_name}.pdf")
+
+    if not os.path.exists(archive_pdf_path): shutil.copy(pdf_path, archive_pdf_path)
+
+    born_digital = True
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(archive_pdf_path)
+        try:
+            raw_meta = pdf.get_metadata_dict()
+            for key, val in raw_meta.items():
+                if val and str(val).strip():
+                    extracted_metadata[key] = fix_mojibake(str(val).strip())
+        except Exception:
+            pass
+
+        analyzer = PdfAnalyzer(archive_pdf_path)
+        born_digital = analyzer.is_born_digital()
+        # The article's first page, not a publisher/repository cover sheet.
+        first = next((i for i in range(len(pdf)) if i not in analyzer.cover_pages()), 0)
+        analyzer.close()
+        cover_path = os.path.join(session_dir, "cover.jpg")
+        if not os.path.exists(cover_path):
+            pdf[first].render(scale=2.0).to_pil().convert("RGB").save(cover_path, format="JPEG")
+        pdf.close()
+    except Exception:
+        pass
+
+    edited_md = os.path.join(work_dir, f"{base_name}_edited.md")
+    json_path = _find_marker_json(work_dir)
+    status = "✅ Cache Hit!"
+    if json_path is None:
+        runner = run_marker(archive_pdf_path, work_dir, force_ocr, born_digital, owner)
+        try:
+            for msg in runner:
+                yield msg, work_dir
+        finally:
+            runner.close()  # on cancel: tears down the marker process group
+        json_path = _find_marker_json(work_dir)
+        if json_path is None:
+            raise RuntimeError("Extractor finished but produced no JSON output.")
+        status = "✅ Done!"
+
+    yield "🧩 Rebuilding document structure (footnotes, figures, boxes, styling)…", work_dir
+    md_content, title, stats = _structure(json_path, archive_pdf_path, work_dir, base_name)
+    _drop_stray_metadata(extracted_metadata, md_content)
+    if title and not any(k.lower() == "title" for k in extracted_metadata):
+        extracted_metadata["title"] = title
+    if os.path.exists(edited_md):
+        with open(edited_md, encoding="utf-8") as f:
+            md_content = f.read()
+        status += " (your saved edits were restored)"
+    summary = _summary(stats)
+    if summary:
+        status += f"\n{summary}"
+    md_file = edited_md if os.path.exists(edited_md) else os.path.join(work_dir, f"{base_name}.md")
+    return work_dir, base_name, extracted_metadata, md_content, md_file, status
+
+
 def extract_markdown(pdf_file, force_ocr):
     if pdf_file is None:
         yield (None, None, {}, "", "", gr.update(visible=False), "⚠️ No file.", gr.update(selected=1), gr.update(interactive=True), gr.update(visible=False), gr.update(interactive=True), gr.update(visible=False))
         return
 
-    base_name = os.path.splitext(os.path.basename(pdf_file.name))[0]
-    extracted_metadata = {}
+    pdf_path = _upload_path(pdf_file)
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
 
     def busy(msg, work_dir=None):
-        return (work_dir, base_name, extracted_metadata, "", "", gr.update(visible=False), msg, gr.update(selected=1), gr.update(interactive=False), gr.update(visible=True), gr.update(interactive=False), gr.update(visible=True))
+        return (work_dir, base_name, {}, "", "", gr.update(visible=False), msg, gr.update(selected=1), gr.update(interactive=False), gr.update(visible=True), gr.update(interactive=False), gr.update(visible=True))
 
     try:
-        yield busy("⚡ Analyzing PDF & Extracting Metadata...")
-
-        file_hash = get_smart_hash(pdf_file.name)
-        session_dir = os.path.join(LIBRARY_BASE_DIR, file_hash)
-        work_dir = os.path.join(session_dir, "ocr" if force_ocr else "auto")
-        os.makedirs(work_dir, exist_ok=True)
-        archive_pdf_path = os.path.join(session_dir, f"{base_name}.pdf")
-
-        if not os.path.exists(archive_pdf_path): shutil.copy(pdf_file.name, archive_pdf_path)
-
-        born_digital = True
-        try:
-            import pypdfium2 as pdfium
-            pdf = pdfium.PdfDocument(archive_pdf_path)
-            try:
-                raw_meta = pdf.get_metadata_dict()
-                for key, val in raw_meta.items():
-                    if val and str(val).strip():
-                        extracted_metadata[key] = fix_mojibake(str(val).strip())
-            except Exception:
-                pass
-
-            analyzer = PdfAnalyzer(archive_pdf_path)
-            born_digital = analyzer.is_born_digital()
-            # The article's first page, not a publisher/repository cover sheet.
-            first = next((i for i in range(len(pdf)) if i not in analyzer.cover_pages()), 0)
-            analyzer.close()
-            cover_path = os.path.join(session_dir, "cover.jpg")
-            if not os.path.exists(cover_path):
-                pdf[first].render(scale=2.0).to_pil().convert("RGB").save(cover_path, format="JPEG")
-            pdf.close()
-        except Exception:
-            pass
-
-        edited_md = os.path.join(work_dir, f"{base_name}_edited.md")
-        json_path = _find_marker_json(work_dir)
-        status = "✅ Cache Hit!"
-        if json_path is None:
-            runner = run_marker(archive_pdf_path, work_dir, force_ocr, born_digital)
-            try:
-                for msg in runner:
-                    yield busy(msg, work_dir)
-            finally:
-                runner.close()  # on cancel: tears down the marker process group
-            json_path = _find_marker_json(work_dir)
-            if json_path is None:
-                raise RuntimeError("Extractor finished but produced no JSON output.")
-            status = "✅ Done!"
-
-        yield busy("🧩 Rebuilding document structure (footnotes, figures, boxes, styling)…", work_dir)
-        md_content, title, stats = _structure(json_path, archive_pdf_path, work_dir, base_name)
-        _drop_stray_metadata(extracted_metadata, md_content)
-        if title and not any(k.lower() == "title" for k in extracted_metadata):
-            extracted_metadata["title"] = title
-        if os.path.exists(edited_md):
-            with open(edited_md, encoding="utf-8") as f:
-                md_content = f.read()
-            status += " (your saved edits were restored)"
-        summary = _summary(stats)
-        if summary:
-            status += f"\n{summary}"
-        md_file = edited_md if os.path.exists(edited_md) else os.path.join(work_dir, f"{base_name}.md")
-        yield (work_dir, base_name, extracted_metadata, md_content, render_preview(md_content, work_dir), gr.update(value=prepare_download(md_file, base_name, ".md"), visible=True), status, gr.update(selected=2), gr.update(interactive=True), gr.update(visible=False), gr.update(interactive=True), gr.update(visible=False))
-
+        work_dir, base_name, metadata, md_content, md_file, status = yield from _relay(
+            _extract(pdf_path, force_ocr, "wizard"), busy)
     except Exception as e:
         yield (None, None, {}, "", "", gr.update(visible=False), f"❌ ERROR: {str(e)}", gr.update(selected=1), gr.update(interactive=True), gr.update(visible=False), gr.update(interactive=True), gr.update(visible=False))
+        return
+    yield (work_dir, base_name, metadata, md_content, render_preview(md_content, work_dir), gr.update(value=prepare_download(md_file, base_name, ".md"), visible=True), status, gr.update(selected=2), gr.update(interactive=True), gr.update(visible=False), gr.update(interactive=True), gr.update(visible=False))
+
+
+def _compile(md_text, metadata_dict, include_toc, math_mode, work_dir, base_name):
+    """Markdown -> EPUB + kepub in work_dir. Returns (epub_path, kepub_path, notes)."""
+    session_dir = os.path.dirname(work_dir)
+
+    # Persist edits so a later visit (cache hit) restores them.
+    generated_path = os.path.join(work_dir, f"{base_name}.md")
+    edited_md_path = os.path.join(work_dir, f"{base_name}_edited.md")
+    generated = ""
+    if os.path.exists(generated_path):
+        with open(generated_path, encoding="utf-8") as f:
+            generated = f.read()
+    if md_text.replace("\r\n", "\n").strip() != generated.strip():
+        with open(edited_md_path, "w", encoding="utf-8") as f: f.write(md_text)
+    final_md_path = os.path.join(work_dir, f"{base_name}_final.md")
+    with open(final_md_path, "w", encoding="utf-8") as f: f.write(md_text)
+
+    epub_meta = {}
+    if not metadata_dict:
+        metadata_dict = {}
+
+    if 'Title' not in metadata_dict and 'title' not in metadata_dict:
+        epub_meta['title'] = base_name
+
+    key_map = {
+        'title': 'title', 'author': 'creator',
+        'subject': 'description', 'description': 'description',
+        'keywords': 'keywords', 'creationdate': 'date'
+    }
+    # A PDF's Creator/Producer name the authoring software ("Adobe PageMaker 6.5"),
+    # not a person: as EPUB creator they would replace the author.
+    skip = {'creator', 'producer', 'moddate', 'trapped'}
+
+    for k, v in metadata_dict.items():
+        k_lower = k.lower()
+        if k_lower in skip:
+            continue
+        target_key = key_map.get(k_lower, k_lower)
+        if k_lower == 'creationdate' and str(v).startswith('D:'):
+            v = str(v)[2:6]
+        epub_meta[target_key] = str(v)
+
+    meta_json_path = os.path.join(work_dir, "metadata.json")
+    with open(meta_json_path, "w", encoding="utf-8") as f:
+        json.dump(epub_meta, f, ensure_ascii=False)
+
+    out_epub_path = os.path.join(work_dir, f"{base_name}.epub")
+    out_kepub_path = os.path.join(work_dir, f"{base_name}.kepub.epub")
+    css = os.path.join(os.path.dirname(os.path.abspath(__file__)), "epub.css")
+
+    notes = epubbuild.build_epub(
+        final_md_path, out_epub_path, [work_dir, session_dir], meta_json_path, css=css,
+        cover=os.path.join(session_dir, "cover.jpg"), toc=include_toc,
+        math_mode="mathml" if str(math_mode).lower().startswith("mathml") else "svg",
+        cache_dir=os.path.join(session_dir, "math_cache"), log=lambda s: None)
+
+    if not epubbuild.kepubify(out_epub_path, out_kepub_path):
+        shutil.copy(out_epub_path, out_kepub_path)
+        notes.append("kepubify not found – Kobo file is a plain EPUB copy")
+    return out_epub_path, out_kepub_path, notes
 
 
 def build_epub(md_text, metadata_dict, include_toc, math_mode, work_dir, base_name):
@@ -490,62 +643,7 @@ def build_epub(md_text, metadata_dict, include_toc, math_mode, work_dir, base_na
         return
     try:
         yield gr.update(value=None), gr.update(value=None), "⏳ Rendering Math locally & Compiling..."
-        session_dir = os.path.dirname(work_dir)
-
-        # Persist edits so a later visit (cache hit) restores them.
-        generated_path = os.path.join(work_dir, f"{base_name}.md")
-        edited_md_path = os.path.join(work_dir, f"{base_name}_edited.md")
-        generated = ""
-        if os.path.exists(generated_path):
-            with open(generated_path, encoding="utf-8") as f:
-                generated = f.read()
-        if md_text.replace("\r\n", "\n").strip() != generated.strip():
-            with open(edited_md_path, "w", encoding="utf-8") as f: f.write(md_text)
-        final_md_path = os.path.join(work_dir, f"{base_name}_final.md")
-        with open(final_md_path, "w", encoding="utf-8") as f: f.write(md_text)
-
-        epub_meta = {}
-        if not metadata_dict:
-            metadata_dict = {}
-
-        if 'Title' not in metadata_dict and 'title' not in metadata_dict:
-            epub_meta['title'] = base_name
-
-        key_map = {
-            'title': 'title', 'author': 'creator',
-            'subject': 'description', 'description': 'description',
-            'keywords': 'keywords', 'creationdate': 'date'
-        }
-        # A PDF's Creator/Producer name the authoring software ("Adobe PageMaker 6.5"),
-        # not a person: as EPUB creator they would replace the author.
-        skip = {'creator', 'producer', 'moddate', 'trapped'}
-
-        for k, v in metadata_dict.items():
-            k_lower = k.lower()
-            if k_lower in skip:
-                continue
-            target_key = key_map.get(k_lower, k_lower)
-            if k_lower == 'creationdate' and str(v).startswith('D:'):
-                v = str(v)[2:6]
-            epub_meta[target_key] = str(v)
-
-        meta_json_path = os.path.join(work_dir, "metadata.json")
-        with open(meta_json_path, "w", encoding="utf-8") as f:
-            json.dump(epub_meta, f, ensure_ascii=False)
-
-        out_epub_path = os.path.join(work_dir, f"{base_name}.epub")
-        out_kepub_path = os.path.join(work_dir, f"{base_name}.kepub.epub")
-        css = os.path.join(os.path.dirname(os.path.abspath(__file__)), "epub.css")
-
-        notes = epubbuild.build_epub(
-            final_md_path, out_epub_path, [work_dir, session_dir], meta_json_path, css=css,
-            cover=os.path.join(session_dir, "cover.jpg"), toc=include_toc,
-            math_mode="mathml" if str(math_mode).lower().startswith("mathml") else "svg",
-            cache_dir=os.path.join(session_dir, "math_cache"), log=lambda s: None)
-
-        if not epubbuild.kepubify(out_epub_path, out_kepub_path):
-            shutil.copy(out_epub_path, out_kepub_path)
-            notes.append("kepubify not found – Kobo file is a plain EPUB copy")
+        out_epub_path, out_kepub_path, notes = _compile(md_text, metadata_dict, include_toc, math_mode, work_dir, base_name)
 
         dl_kobo = prepare_download(out_kepub_path, base_name, ".kepub.epub")
         dl_std = prepare_download(out_epub_path, base_name, ".epub")
@@ -556,6 +654,61 @@ def build_epub(md_text, metadata_dict, include_toc, math_mode, work_dir, base_na
         yield gr.update(value=dl_kobo), gr.update(value=dl_std), msg
     except Exception as e:
         yield gr.update(value=None), gr.update(value=None), f"❌ Build Error: {str(e)}"
+
+
+# ------------------------------------------------------------------ bulk
+
+def bulk_convert(pdf_files, force_ocr, include_toc, math_mode):
+    """Extract and build every uploaded PDF in turn, without the review step.
+    Yields (log, outputs, start_btn, stop_btn, file input)."""
+    paths = [_upload_path(f) for f in pdf_files or []]
+    if not paths:
+        yield "⚠️ No files.", gr.update(value=None), gr.update(interactive=True), gr.update(visible=False), gr.update(interactive=True)
+        return
+
+    done_lines, outputs, sources = [], [], []
+
+    def busy(current, files=gr.update()):
+        log = "\n".join(done_lines + ([current] if current else []))
+        return log, files, gr.update(interactive=False), gr.update(visible=True), gr.update(interactive=False)
+
+    failed = 0
+    for i, pdf_path in enumerate(paths, 1):
+        name = os.path.basename(pdf_path)
+        head = f"[{i}/{len(paths)}] {name}"
+        try:
+            work_dir, base_name, metadata, md_content, _, status = yield from _relay(
+                _extract(pdf_path, force_ocr, "bulk"), lambda msg, _: busy(f"{head}\n{msg}"))
+            yield busy(f"{head}\n⏳ Rendering Math locally & Compiling...")
+            epub_path, kepub_path, notes = _compile(md_content, metadata, include_toc, math_mode, work_dir, base_name)
+            for path, ext in ((kepub_path, ".kepub.epub"), (epub_path, ".epub")):
+                outputs.append(prepare_download(path, base_name, ext))
+                sources.append((path, base_name + ext))
+            line = f"✅ {head} – {status.splitlines()[0].lstrip('✅ ')}"
+            if notes:
+                line += " (" + "; ".join(notes) + ")"
+        except Exception as e:
+            failed += 1
+            line = f"❌ {head} – {e}"
+        done_lines.append(line)
+        yield busy(None, gr.update(value=list(outputs) or None))
+
+    if len(outputs) > 2:
+        zip_dir = os.path.join(DELIVERY_BASE_DIR, uuid.uuid4().hex[:8])
+        os.makedirs(zip_dir, exist_ok=True)
+        zip_path = os.path.join(zip_dir, "epubs.zip")
+        with zipfile.ZipFile(zip_path, "w") as z:
+            # From the library, not the delivery copies: on a long run those expire.
+            for path, arcname in sources:
+                z.write(path, arcname)
+        outputs.insert(0, zip_path)
+    done_lines.append(f"🏁 Finished: {len(paths) - failed} converted, {failed} failed.")
+    yield "\n".join(done_lines), gr.update(value=outputs or None), gr.update(interactive=True), gr.update(visible=False), gr.update(interactive=True)
+
+
+def cancel_bulk():
+    _stop_job("bulk")
+    return gr.update(interactive=True), gr.update(visible=False), gr.update(interactive=True)
 
 
 with gr.Blocks(title="PDF to EPUB Wizard") as interface:
@@ -608,6 +761,25 @@ with gr.Blocks(title="PDF to EPUB Wizard") as interface:
                     interactive=False
                 )
 
+        with gr.TabItem("📚 Bulk Convert", id=4):
+            gr.Markdown("⚠️ **Manual edits are disabled for bulk uploads.** Each PDF goes straight from extraction "
+                        "to EPUB without the Review & Edit step. Edits you saved earlier for a PDF in the single-file "
+                        "wizard are still applied. To fix one result, run that PDF through the wizard afterwards: "
+                        "the extraction is cached, so it won't run again.")
+            with gr.Row():
+                with gr.Column(variant="panel"):
+                    bulk_input = gr.File(label="Upload PDFs", file_types=[".pdf"], file_count="multiple")
+                    bulk_ocr_cb = gr.Checkbox(label="Force OCR for all files", value=False)
+                    bulk_toc_cb = gr.Checkbox(label="Generate TOC", value=True)
+                    bulk_math_radio = gr.Radio(["SVG (works on all readers)", "MathML (smaller; Apple Books, Thorium)"],
+                                               value="MathML (smaller; Apple Books, Thorium)" if DEFAULT_MATH_MODE == "mathml" else "SVG (works on all readers)",
+                                               label="Math rendering")
+                    bulk_start_btn = gr.Button("Convert All", variant="primary", interactive=False)
+                    bulk_stop_btn = gr.Button("🛑 Stop", variant="stop", visible=False)
+                bulk_log = gr.Textbox(label="Progress", interactive=False, lines=12)
+            bulk_output = gr.File(label="EPUBs (.kepub.epub for Kobo, .epub for everything else; epubs.zip holds them all)",
+                                  file_count="multiple", interactive=False)
+
     pdf_input.upload(fn=enable_start_btn, inputs=[pdf_input], outputs=[start_btn])
 
     ext_ev = start_btn.click(
@@ -632,6 +804,14 @@ with gr.Blocks(title="PDF to EPUB Wizard") as interface:
     )
 
     md_editor.change(fn=render_preview, inputs=[md_editor, session_state], outputs=[md_preview], trigger_mode="always_last")
+
+    bulk_input.change(fn=enable_start_btn, inputs=[bulk_input], outputs=[bulk_start_btn])
+    bulk_ev = bulk_start_btn.click(
+        fn=bulk_convert,
+        inputs=[bulk_input, bulk_ocr_cb, bulk_toc_cb, bulk_math_radio],
+        outputs=[bulk_log, bulk_output, bulk_start_btn, bulk_stop_btn, bulk_input]
+    )
+    bulk_stop_btn.click(fn=cancel_bulk, outputs=[bulk_start_btn, bulk_stop_btn, bulk_input], cancels=[bulk_ev])
 
 if __name__ == "__main__":
     print(f"PDF to EPUB Wizard, build {os.environ.get('APP_REVISION', 'dev')}", flush=True)

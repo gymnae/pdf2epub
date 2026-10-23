@@ -24,9 +24,10 @@ import difflib
 import html as htmllib
 import os
 import re
+import statistics
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from urllib.parse import quote
 
@@ -264,6 +265,106 @@ def escape_line_start(md):
     if md[:1] in "-+:%=":
         return "\\" + md
     return md
+
+
+# --------------------------------------------------------------------------- lists
+
+# A list item's own number: "1." "1)" "(1)" "a." "(iv)", or a bare "1" (some journals).
+_ENUM = re.compile(r"(?:\((?P<paren>\d{1,3}|[a-z]|[ivx]{1,6})\)|(?P<tok>\d{1,3}|[a-z]|[ivx]{1,6})(?P<delim>[.)])"
+                   r"|(?P<bare>\d{1,3}))(?=\s)")
+_ROMAN = {"i": 1, "v": 5, "x": 10}
+
+
+def _roman(tok):
+    vals = [_ROMAN[c] for c in tok]
+    return sum(-v if i + 1 < len(vals) and v < vals[i + 1] else v for i, v in enumerate(vals))
+
+
+def _enumerator(text):
+    """-> (kind, delim, token) of the number a list item starts with, or None.
+    kind: "decimal", "alpha" or "roman" ("i" stays ambiguous: kind "alpha|roman")."""
+    m = _ENUM.match(text.lstrip())
+    if not m:
+        return None
+    if m.group("paren"):
+        tok, delim = m.group("paren"), "()"
+    elif m.group("bare"):
+        tok, delim = m.group("bare"), "."
+    else:
+        tok, delim = m.group("tok"), m.group("delim")
+    if tok.isdigit():
+        return "decimal", delim, tok
+    if re.fullmatch(r"[ivx]+", tok):
+        return ("alpha|roman" if len(tok) == 1 else "roman"), delim, tok
+    return "alpha", delim, tok
+
+
+def _enum_value(kind, tok):
+    return int(tok) if kind == "decimal" else _roman(tok) if kind == "roman" else ord(tok) - 96
+
+
+def _numbering(texts):
+    """-> (kind, delim, [values]) if every text starts with the next number of one
+    sequence (1, 2, 3 / a, b, c / i, ii, iii, in one delimiter style), else None."""
+    enums = [_enumerator(t) for t in texts]
+    if not enums or None in enums or len({d for _, d, _ in enums}) != 1:
+        return None
+    for kind in ("decimal", "alpha", "roman"):
+        if not all(kind in k.split("|") for k, _, _ in enums):
+            continue
+        values = [_enum_value(kind, tok) for _, _, tok in enums]
+        if all(b == a + 1 for a, b in zip(values, values[1:])):
+            return kind, enums[0][1], values
+    return None
+
+
+def _run_in(text):
+    """True for '1. The chief executive ... 2. The legislature ...': numbered points
+    set as one running paragraph (a quotation), which is not a list."""
+    e = _enumerator(text)
+    if not e or e[0] != "decimal":
+        return False
+    nxt = int(e[2]) + 1
+    marker = {"()": rf"\({nxt}\)", ".": rf"{nxt}\.", ")": rf"{nxt}\)"}[e[1]]
+    return re.search(rf"[.;:?!'’\"”)]\s+{marker}\s+\S", text) is not None
+
+
+def _list_marker(kind, delim, value):
+    tok = str(value) if kind == "decimal" else chr(96 + value) if kind == "alpha" else \
+        "".join(r * n for r, n in _roman_digits(value))
+    return f"({tok})" if delim == "()" else tok + delim
+
+
+def _roman_digits(value):
+    out = []
+    for r, v in (("x", 10), ("ix", 9), ("v", 5), ("iv", 4), ("i", 1)):
+        n, value = divmod(value, v)
+        out.append((r, n))
+    return out
+
+
+def _split_html(html, k):
+    """Split an inline html fragment before its k-th non-space text character;
+    tags open at that point are closed in the head and reopened in the tail."""
+    count, stack, pos = 0, [], 0
+    for m in re.finditer(r"<(/?)([a-zA-Z][\w-]*)[^>]*?(/?)>|&#?\w+;|[^<&]", html):
+        if m.group(2):
+            if m.group(1):
+                if stack and stack[-1][0] == m.group(2).lower():
+                    stack.pop()
+            elif not m.group(3) and m.group(2).lower() not in ("br", "img", "hr"):
+                stack.append((m.group(2).lower(), m.group(0)))
+            continue
+        if not m.group(0).isspace():
+            if count == k:
+                pos = m.start()
+                break
+            count += 1
+    else:
+        return html, ""
+    head = html[:pos].rstrip() + "".join(f"</{name}>" for name, _ in reversed(stack))
+    tail = "".join(tag for _, tag in stack) + html[pos:]
+    return head, tail
 
 
 # --------------------------------------------------------------------------- math
@@ -785,7 +886,7 @@ def _table_columns(table):
 
 @dataclass
 class Item:
-    kind: str                 # heading para list figure table equation footnote caption box code
+    kind: str                 # heading para quote list figure table equation footnote caption box code
     page: int
     bbox: tuple
     html: str = ""
@@ -793,6 +894,8 @@ class Item:
     level: int = 0            # heading: marker's level, then the normalised level
     caption: "Item" = None
     children: list = field(default_factory=list)   # list: li htmls; box: items
+    boxes: list = field(default_factory=list)      # list: each li's bbox
+    numbering: tuple = None                        # ordered list: (style, first, last), set when rendered
     images: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)      # (note_id, html) defined after this item
     affiliations: list = field(default_factory=list)  # note htmls shown as a block after a byline
@@ -1011,7 +1114,8 @@ class Converter:
             return main + rest
         if bt == "ListGroup":
             lis = [restore_tags(k.get("html") or "") for k in kids] or [html]
-            return [Item("list", pnum, bbox, " ".join(lis), bt, children=lis)]
+            boxes = [_norm_bbox(k.get("bbox") or pb, pb, self._page_frame) for k in kids] or [bbox]
+            return [Item("list", pnum, bbox, " ".join(lis), bt, children=lis, boxes=boxes)]
         if kids and bt not in PARA_TYPES | IMAGE_TYPES | {"Table", "Form", "Caption", "Footnote",
                                                          "SectionHeader", "Equation", "Code"}:
             out = []
@@ -1724,7 +1828,7 @@ class Converter:
 
     @staticmethod
     def _place_token(cand, pattern, token):
-        if cand.kind not in ("para", "list", "caption", "heading", "equation"):
+        if cand.kind not in ("para", "quote", "list", "caption", "heading", "equation"):
             return False
         if cand.kind == "list":
             for i, li in enumerate(cand.children):
@@ -1950,14 +2054,22 @@ class Converter:
             return md
         if it.kind == "footnote":   # left over when nothing could be anchored
             return "::: {.footnote-text}\n" + escape_line_start(inline_md(it.html, ctx)) + "\n:::"
+        if it.kind == "quote":
+            md = self._render(replace(it, kind="para"))
+            return "\n".join("> " + line if line else ">" for line in md.split("\n"))
         if it.kind == "list":
-            lines = []
-            for li in it.children:
-                md = inline_md(li, ctx)
-                md = re.sub(r"^(?:[•●▪◦‣∙·–—]|\\-)\s*", "", md)
-                if md:
-                    lines.append("- " + md)
-            return "\n".join(lines)
+            mds = [re.sub(r"^(?:[•●▪◦‣∙·–—]|\\-)\s*", "", inline_md(li, ctx)) for li in it.children]
+            mds = [md for md in mds if md]
+            numbering = _numbering([_unescape_md(md) for md in mds])
+            if numbering:
+                # The PDF's own numbers as a real ordered list ("- 1. text" would nest
+                # a numbered list inside a bulleted one).
+                kind, delim, values = numbering
+                rest = [re.sub(r"^\\?\(?\s*\w{1,6}\s*\\?[.)]?\s+", "", md, count=1) for md in mds]
+                it.numbering = (kind, delim, values[0], values[-1])
+                return "\n".join(_list_marker(kind, delim, v) + " " + escape_line_start(r)
+                                 for v, r in zip(values, rest))
+            return "\n".join("- " + md for md in mds)
         if it.kind == "code":
             code = plain_text(parse_html(it.html)).strip("\n")
             fence = "~~~~" if "```" in code else "```"
@@ -2208,14 +2320,146 @@ class Converter:
         last = re.search(r"(?<![\w.])([A-Za-zÀ-ÿ]+)$", tail)
         return bool(last) and last.group(1).lower() in CONTINUATION_WORDS and len(tail) >= 80
 
+    # ---- lists
+
+    def _body_lines(self, page):
+        """-> (lines, body_left, body_height) of a page's text layer (page fractions);
+        body text is the dominant size among wide lines, its left edge their median."""
+        cache = self.__dict__.setdefault("_body_line_cache", {})
+        if page not in cache:
+            cache[page] = None
+            try:
+                lines = self.an.text_lines(page)
+            except Exception:
+                lines = []
+            wide = [fr for fr, n, _ in lines if n >= 20 and fr[2] - fr[0] >= 0.25 and fr[2] - fr[0] > fr[3] - fr[1]]
+            if len(wide) >= 3:
+                body_h = statistics.median(fr[3] - fr[1] for fr in wide)
+                body = [fr for fr in wide if abs((fr[3] - fr[1]) - body_h) <= 0.08 * body_h]
+                cache[page] = (lines, statistics.median(fr[0] for fr in body), body_h)
+        return cache[page]
+
+    def _li_parts(self, page, li, box, in_refs=False):
+        """-> [(kind, html)] for one list item marker found: kind "li" (a real item),
+        "para" (body text marker took for an item) or "quote" (an indented passage in
+        smaller type, such as numbered points quoted as one paragraph)."""
+        text = html_plain(li).strip()
+        metrics = self._body_lines(page) if self.an is not None and not in_refs else None
+        if metrics is None:
+            return [("para" if _run_in(text) else "li", li)]
+        lines, body_left, body_h = metrics
+        x0, y0, x1, y1 = box
+        mine = [(fr, t) for fr, n, t in lines if t.strip()
+                and x0 - 0.01 <= (fr[0] + fr[2]) / 2 <= x1 + 0.01 and y0 - 0.004 <= (fr[1] + fr[3]) / 2 <= y1 + 0.004]
+        if not mine:
+            return [("para" if _run_in(text) else "li", li)]
+
+        def small(fr):
+            return (fr[3] - fr[1]) < 0.92 * body_h
+
+        def flush(fr):
+            return abs(fr[0] - body_left) <= 0.008
+
+        if "<math" in li:
+            return [("li", li)]
+        if _run_in(text):
+            return [("quote" if all(small(fr) and not flush(fr) for fr, _ in mine) else "para", li)]
+        first = mine[0][1].lstrip()
+        # Some fonts map their bullet to "." in the text layer (". What are ...").
+        bullet = first[:1] in BULLETS or re.match(r"\.\s", first)
+        body = [fr for fr, _ in mine if not small(fr)]
+        if (_enumerator(text) or bullet or len(body) < 2 or small(mine[0][0])
+                or not all(flush(fr) for fr in body)):
+            return [("li", li)]
+
+        # Body text: flush with the text column at body size. Lines in smaller type
+        # further in are a quotation marker merged into it.
+        runs = []
+        for fr, t in mine:
+            kind = "quote" if small(fr) and not flush(fr) else "para"
+            if not runs or runs[-1][0] != kind:
+                runs.append((kind, t))
+        key = [c.lower() for c in text if c.isalnum()]
+        nonspace = [i for i, c in enumerate(c for c in text if not c.isspace()) if c.isalnum()]
+        parts, done = [], 0
+        for (kind, _), (_, start) in zip(runs, runs[1:] + [(None, None)]):
+            if start is None:
+                parts.append([kind, li])
+                break
+            probe = [c.lower() for c in fix_text(start) if c.isalnum()][:15]
+            at = next((i for i in range(done, len(key) - len(probe) + 1) if key[i:i + len(probe)] == probe), None)
+            if len(probe) < 6 or at is None:
+                parts.append([kind, li])        # can't place the boundary: keep the rest together
+                break
+            head, li = _split_html(li, nonspace[at] - (nonspace[done] if done else 0))
+            parts.append([kind, head])
+            done = at
+        # "– but also offers ...": marker took the dash opening the paragraph for a bullet.
+        if first[:1] in "–—" and not text.startswith(first[:1]) and parts and parts[0][0] == "para":
+            parts[0][1] = first[0] + " " + parts[0][1]
+        return [(k, h) for k, h in parts if html_plain(h).strip()]
+
+    def _lists(self, items):
+        """Splits marker's list groups into what the PDF shows: real items stay a list;
+        body text and quotations swept into a group become paragraphs and quotes."""
+        out, in_refs = [], False
+        for it in items:
+            if it.kind == "heading":
+                in_refs = bool(REFERENCE_HEADINGS.match(it.text))
+            if it.kind != "list":
+                out.append(it)
+                continue
+            lis, boxes = [], []
+
+            def flush():
+                if lis:
+                    box = boxes[0]
+                    for b in boxes[1:]:
+                        box = _union(box, b)
+                    out.append(Item("list", it.page, box, " ".join(lis), it.btype, children=list(lis), boxes=list(boxes)))
+                    lis.clear()
+                    boxes.clear()
+
+            boxes_in = it.boxes if len(it.boxes) == len(it.children) else [it.bbox] * len(it.children)
+            for li, box in zip(it.children, boxes_in):
+                # A bullet read as a full stop: ". What results have been achieved ..."
+                li = re.sub(r"^(\s*(?:<[^>]+>\s*)*)\.\s+(?=\S)", r"\1", li)
+                for kind, part in self._li_parts(it.page, li, box, in_refs):
+                    if kind == "li":
+                        lis.append(part)
+                        boxes.append(box)
+                    else:
+                        flush()
+                        out.append(Item(kind, it.page, box, part, "ListItem"))
+                        self._count("list_items_not_a_list")
+            flush()
+            if it.notes and out:
+                out[-1].notes = list(it.notes)
+        return out
+
     def _merge_continuations(self, blocks):
         """blocks: list of [item, md]. Joins paragraphs split by page/column breaks or
         floats (figures, tables, boxes); the floats end up after the joined paragraph."""
         out = []
         open_idx = None
         open_page = None          # page of the open paragraph's last piece
+        open_list = None          # index of the last numbered list, while only floats follow it
         for blk in blocks:
             it, md = blk
+            if it.kind == "list" and it.numbering and open_list is not None:
+                prev_it, prev_md = out[open_list]
+                k, d, first, last = prev_it.numbering
+                if (k, d) == it.numbering[:2] and it.numbering[2] == last + 1 and it.page - prev_it.page <= 1:
+                    # Notes 1-11 on one page, 12-15 on the next: one list, not two.
+                    prev_it.numbering = (k, d, first, it.numbering[3])
+                    prev_it.notes.extend(it.notes)
+                    out[open_list] = [prev_it, prev_md + "\n" + md]
+                    prev_it.page = it.page
+                    continue
+            if it.kind == "list" and it.numbering:
+                open_list = len(out)
+            elif it.kind not in ("figure", "table", "box", "caption", "footnote"):
+                open_list = None
             if (it.kind == "para" and open_idx is not None and len(md) < 300
                     and re.fullmatch(r"\(.*\)", md.strip(), re.S) and not self._starts_continuation(md, out[open_idx][1])):
                 # "(The positive ions X+ are called cations ...)" set beside an equation:
@@ -2266,6 +2510,7 @@ class Converter:
         self._table_text_fix(items)
         self._math_fix(items)
         self._scripts(items)
+        items = self._lists(items)
         items = self._drop_caps(items)
         items = self._figures_and_captions(items)
         items = self._drop_figure_labels(items)
@@ -2302,7 +2547,8 @@ class Converter:
                     in_refs = True
                 continue
             if in_refs and it.kind in ("list", "para") and not it.notes:
-                entries = [escape_line_start(line[2:]) for line in md.split("\n")] if it.kind == "list" else [md]
+                entries = ([escape_line_start(line[2:] if line.startswith("- ") else line) for line in md.split("\n")]
+                           if it.kind == "list" else [md])
                 for entry in entries:
                     head = _unescape_md(entry).lstrip("*_[")
                     if ref_open and (head[:1].islower() or _unescape_md(out[-1]).endswith(("/", "-"))):

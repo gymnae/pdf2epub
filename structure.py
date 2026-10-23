@@ -36,6 +36,10 @@ TABLE_IMAGE_MIN_COLS = int(os.environ.get("TABLE_IMAGE_MIN_COLS", "7"))
 TABLE_WIDE_COLS = int(os.environ.get("TABLE_WIDE_COLS", "5"))
 FIGURE_DPI = int(os.environ.get("FIGURE_DPI", "220"))
 FIGURE_MAX_PX = int(os.environ.get("FIGURE_MAX_PX", "1600"))
+# Tables shown as pictures are mostly small type: sharper than figures, so the
+# reader's image zoom stays legible.
+TABLE_IMAGE_DPI = int(os.environ.get("TABLE_IMAGE_DPI", "300"))
+TABLE_IMAGE_MAX_PX = int(os.environ.get("TABLE_IMAGE_MAX_PX", "2400"))
 # Uncaptioned pictures smaller than this (fraction of the page) are publisher
 # logos, licence badges, "Check for updates" buttons and the like.
 DECORATION_MAX_AREA = float(os.environ.get("DECORATION_MAX_AREA", "0.025"))
@@ -2000,13 +2004,13 @@ class Converter:
         regex, styles = self._style_cache[page]
         return _Ctx(style_re=regex, styles=styles, heading=heading, stats=self.stats)
 
-    def _save_image(self, item, rect, stem):
+    def _save_image(self, item, rect, stem, dpi=FIGURE_DPI, max_px=FIGURE_MAX_PX):
         os.makedirs(os.path.join(self.out_dir, self.image_subdir), exist_ok=True)
         data = ext = None
         if self.an is not None:
             try:
                 from pdfanalysis import encode_image
-                img = self.an.render_region(item.page, rect, dpi=FIGURE_DPI, max_px=FIGURE_MAX_PX, pad=0)
+                img = self.an.render_region(item.page, rect, dpi=dpi, max_px=max_px, pad=0)
                 if img is not None:
                     data, ext = encode_image(img)
             except Exception:
@@ -2147,7 +2151,7 @@ class Converter:
             self._fig_count += 1
             x0, y0, x1, y1 = it.bbox
             rel = self._save_image(it, (x0 - 0.004, y0 - 0.004, x1 + 0.004, y1 + 0.004),
-                                   f"p{it.page + 1}_table{self._fig_count}")
+                                   f"p{it.page + 1}_table{self._fig_count}", TABLE_IMAGE_DPI, TABLE_IMAGE_MAX_PX)
             if rel:
                 parts.append(f"![]({rel}){{.table-image}}")
         if table is not None and not it.drawn:

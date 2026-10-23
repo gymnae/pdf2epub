@@ -1002,8 +1002,14 @@ class PdfAnalyzer:
 
 
 def encode_image(img):
-    """PNG for line art (smaller and sharper), JPEG for photos. Returns (bytes, ext)."""
+    """PNG for line art (smaller and sharper), JPEG for photos; grayscale when there is
+    no colour (a third of the size). Opaque on purpose: transparent black-on-clear art
+    disappears on readers that keep images unchanged in dark mode. Returns (bytes, ext)."""
+    from PIL import ImageChops
     img = img.convert("RGB")
+    r, g, b = img.split()
+    if max(ImageChops.difference(r, g).getextrema()[1], ImageChops.difference(g, b).getextrema()[1]) <= 8:
+        img = img.convert("L")
     png, jpg = io.BytesIO(), io.BytesIO()
     img.save(png, format="PNG", optimize=True)
     img.save(jpg, format="JPEG", quality=85, optimize=True)

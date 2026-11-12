@@ -704,8 +704,15 @@ class _Ctx:
 
 def _wrap(delim, inner):
     core = inner.strip()
-    if not core:
+    # Punctuation alone is not emphasis: publishers set citation commas in the bold
+    # font ("Das<b>, </b>2002"), invisible on paper, and "Das**,** 2002" next to other
+    # delimiters makes pandoc open a bold run that swallows the rest of the paragraph.
+    if not core or not re.search(r"\w", _unescape_md(core)):
         return inner
+    # "<b>, Anisha Aryal:</b>": the comma belongs to the sentence, not the name
+    m = re.match(r"(?:[,;]\s*)+", core)
+    if m:
+        return inner[:len(inner) - len(inner.lstrip())] + m.group(0) + _wrap(delim, core[m.end():] + inner[len(inner.rstrip()):])
     lead = inner[:len(inner) - len(inner.lstrip())]
     trail = inner[len(inner.rstrip()):]
     return f"{lead}{delim}{core}{delim}{trail}"
@@ -737,6 +744,41 @@ def _text_md(text, ctx):
     return "".join(out)
 
 
+_EMPH_KIND = {"i": "i", "em": "i", "b": "b", "strong": "b"}
+
+
+def _merge_runs(children):
+    """`<i>Dendrocalamus ha</i><i>miltonii</i>` (one word, hyphenated across a PDF
+    line) -> one run. Rendered apart it reads "*Dendrocalamus ha**miltonii*", and
+    pandoc takes the "**" for bold. A soft hyphen between the runs does not count."""
+    out = []
+    for c in children:
+        if isinstance(c, str) and not c.replace("­", "").replace("￾", ""):
+            if out and not isinstance(out[-1], str):
+                continue                      # dropped like fix_text would
+        if (not isinstance(c, str) and out and not isinstance(out[-1], str)
+                and _EMPH_KIND.get(c.tag) and _EMPH_KIND.get(c.tag) == _EMPH_KIND.get(out[-1].tag)):
+            merged = _Node(out[-1].tag, out[-1].attrs)
+            merged.children = out[-1].children + c.children
+            out[-1] = merged
+            continue
+        out.append(c)
+    return out
+
+
+def _join_runs(parts):
+    """Join rendered pieces; where one ends in the delimiter the next starts with
+    ("*a*" + "*b*", e.g. a marker tag beside a style recovered from the PDF),
+    fuse the two runs so no "**" appears mid-word."""
+    out = ""
+    for p in parts:
+        m = re.search(r"(?<![*\\\s])(\*{1,3})$", out)
+        if m and p.startswith(m.group(1)) and not p[len(m.group(1)):][:1] in ("*", " ", ""):
+            out, p = out[:m.start()], p[len(m.group(1)):]
+        out += p
+    return out
+
+
 def render_inline(node, ctx):
     if isinstance(node, str):
         return _text_md(node, ctx)
@@ -753,7 +795,7 @@ def render_inline(node, ctx):
 
     def inner(**changes):
         sub = _Ctx(**{**ctx.__dict__, **changes})
-        return "".join(render_inline(c, sub) for c in node.children)
+        return _join_runs([render_inline(c, sub) for c in _merge_runs(node.children)])
 
     if tag in ("i", "em"):
         return inner() if ctx.no_italic else _wrap("*", inner(styled=True))

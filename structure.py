@@ -2426,7 +2426,7 @@ class Converter:
                 lines = []
             wide = [fr for fr, n, _ in lines if n >= 20 and fr[2] - fr[0] >= 0.25 and fr[2] - fr[0] > fr[3] - fr[1]]
             if len(wide) >= 3:
-                body_h = statistics.median(fr[3] - fr[1] for fr in wide)
+                body_h = statistics.median_low(fr[3] - fr[1] for fr in wide)
                 body = [fr for fr in wide if abs((fr[3] - fr[1]) - body_h) <= 0.08 * body_h]
                 cache[page] = (lines, statistics.median(fr[0] for fr in body), body_h)
         return cache[page]
